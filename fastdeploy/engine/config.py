@@ -25,6 +25,7 @@ from fastdeploy.config import (
     ModelConfig,
     ParallelConfig,
 )
+from fastdeploy.multimodal.registry import MultimodalRegistry
 from fastdeploy.platforms import current_platform
 from fastdeploy.scheduler import SchedulerConfig
 from fastdeploy.utils import ceil_div, get_host_ip, is_port_available, llm_logger
@@ -78,13 +79,14 @@ class Config:
         engine_worker_queue_port: int = 8002,
         limit_mm_per_prompt: Optional[Dict[str, Any]] = None,
         mm_processor_kwargs: Optional[Dict[str, Any]] = None,
-        enable_mm: bool = False,
+        # enable_mm: bool = False,
         splitwise_role: str = "mixed",
         innode_prefill_ports: Optional[List[int]] = None,
         max_num_partial_prefills: int = 1,
         max_long_partial_prefills: int = 1,
         long_prefill_token_threshold: int = 0,
         reasoning_parser: str = None,
+        tool_parser: str = None,
         guided_decoding_backend: Optional[str] = None,
         disable_any_whitespace: bool = False,
         enable_logprob: bool = False,
@@ -156,7 +158,7 @@ class Config:
         self.max_num_seqs = max_num_seqs
         self.limit_mm_per_prompt = limit_mm_per_prompt
         self.mm_processor_kwargs = mm_processor_kwargs
-        self.enable_mm = enable_mm
+        # self.enable_mm = enable_mm
         self.speculative_config = speculative_config
         self.use_warmup = use_warmup
         self.splitwise_role = splitwise_role
@@ -165,6 +167,7 @@ class Config:
         self.max_long_partial_prefills = max_long_partial_prefills
         self.long_prefill_token_threshold = long_prefill_token_threshold
         self.reasoning_parser = reasoning_parser
+        self.tool_parser = tool_parser
         self.graph_optimization_config = graph_optimization_config
         self.early_stop_config = early_stop_config
         self.guided_decoding_backend = guided_decoding_backend
@@ -174,11 +177,19 @@ class Config:
 
         assert self.splitwise_role in ["mixed", "prefill", "decode"]
 
+        import fastdeploy.model_executor.models  # noqa: F401
+
+        architectures = self.model_config.architectures[0]
+        if MultimodalRegistry.contains_model(architectures):
+            self.enable_mm = True
+        else:
+            self.enable_mm = False
+
         # TODO
         self.max_prefill_batch = 3
         if current_platform.is_xpu():
             self.max_prefill_batch = 1
-        if enable_mm:
+        if self.enable_mm:
             self.max_prefill_batch = 1  # TODO:当前多模prefill阶段只支持并行度为1,待优化
 
         # TODO(@wufeisheng): TP and EP need to be supported simultaneously.
@@ -236,7 +247,10 @@ class Config:
             if self.cache_config.enable_chunked_prefill:
                 self.max_num_batched_tokens = 2048
             else:
-                self.max_num_batched_tokens = self.max_model_len
+                if not int(os.getenv("ENABLE_V1_KVCACHE_SCHEDULER", "0")):
+                    self.max_num_batched_tokens = self.max_model_len
+                else:
+                    self.max_num_batched_tokens = 8192  # if set to max_model_len, it's easy to be OOM
 
         if self.long_prefill_token_threshold == 0:
             self.long_prefill_token_threshold = int(self.max_model_len * 0.04)
@@ -284,10 +298,11 @@ class Config:
         )
 
         if not self.cache_config.enable_chunked_prefill:
-            assert self.max_num_batched_tokens >= self.max_model_len, (
-                f"max_num_batched_tokens: {self.max_num_batched_tokens} "
-                f"should be larger than or equal to max_model_len: {self.max_model_len}"
-            )
+            if not int(os.getenv("ENABLE_V1_KVCACHE_SCHEDULER", "0")):
+                assert self.max_num_batched_tokens >= self.max_model_len, (
+                    f"max_num_batched_tokens: {self.max_num_batched_tokens} "
+                    f"should be larger than or equal to max_model_len: {self.max_model_len}"
+                )
         else:
             assert self.max_num_batched_tokens >= self.cache_config.block_size, (
                 f"max_num_batched_tokens: {self.max_num_batched_tokens} "
