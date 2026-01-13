@@ -1,17 +1,29 @@
+"""
+# Copyright (c) 2025  PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+
 import os
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
-from fastdeploy.engine.request import Request
 from fastdeploy.engine.sampling_params import SamplingParams
 from fastdeploy.entrypoints.chat_utils import load_chat_template
 from fastdeploy.entrypoints.llm import LLM
 from fastdeploy.entrypoints.openai.protocol import ChatCompletionRequest
 from fastdeploy.entrypoints.openai.serving_chat import OpenAIServingChat
-from fastdeploy.input.ernie_processor import ErnieProcessor
-from fastdeploy.input.ernie_vl_processor import ErnieMoEVLProcessor
-from fastdeploy.input.text_processor import DataProcessor
 
 
 class TestLodChatTemplate(unittest.IsolatedAsyncioTestCase):
@@ -57,15 +69,21 @@ class TestLodChatTemplate(unittest.IsolatedAsyncioTestCase):
     async def test_serving_chat(self):
         request = ChatCompletionRequest(messages=[{"role": "user", "content": "你好"}])
         self.chat_completion_handler = OpenAIServingChat(
-            self.mock_engine, pid=123, ips=None, max_waiting_time=-1, chat_template=self.input_chat_template
+            self.mock_engine,
+            models=None,
+            pid=123,
+            ips=None,
+            max_waiting_time=-1,
+            chat_template=self.input_chat_template,
         )
 
         async def mock_chat_completion_full_generator(
-            request, request_id, model_name, prompt_token_ids, text_after_process
+            request, request_id, model_name, prompt_token_ids, prompt_tokens, max_tokens_list
         ):
             return prompt_token_ids
 
-        def mock_format_and_add_data(current_req_dict):
+        async def mock_format_and_add_data(current_req_dict):
+            current_req_dict["text_after_process"] = "你好"
             return current_req_dict
 
         self.chat_completion_handler.chat_completion_full_generator = mock_chat_completion_full_generator
@@ -79,15 +97,21 @@ class TestLodChatTemplate(unittest.IsolatedAsyncioTestCase):
     async def test_serving_chat_cus(self):
         request = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], chat_template="hello")
         self.chat_completion_handler = OpenAIServingChat(
-            self.mock_engine, pid=123, ips=None, max_waiting_time=10, chat_template=self.input_chat_template
+            self.mock_engine,
+            models=None,
+            pid=123,
+            ips=None,
+            max_waiting_time=10,
+            chat_template=self.input_chat_template,
         )
 
         async def mock_chat_completion_full_generator(
-            request, request_id, model_name, prompt_token_ids, text_after_process
+            request, request_id, model_name, prompt_token_ids, prompt_tokens, max_tokens_list
         ):
             return prompt_token_ids
 
-        def mock_format_and_add_data(current_req_dict):
+        async def mock_format_and_add_data(current_req_dict):
+            current_req_dict["text_after_process"] = "你好"
             return current_req_dict
 
         self.chat_completion_handler.chat_completion_full_generator = mock_chat_completion_full_generator
@@ -97,90 +121,6 @@ class TestLodChatTemplate(unittest.IsolatedAsyncioTestCase):
         self.chat_completion_handler.engine_client.semaphore.status = MagicMock(return_value="mock_status")
         chat_completion = await self.chat_completion_handler.create_chat_completion(request)
         self.assertEqual("hello", chat_completion["chat_template"])
-
-    @patch("fastdeploy.input.ernie_vl_processor.ErnieMoEVLProcessor.__init__")
-    def test_vl_processor(self, mock_class):
-        mock_class.return_value = None
-        vl_processor = ErnieMoEVLProcessor()
-        mock_request = Request.from_dict({"request_id": "123"})
-
-        def mock_apply_default_parameters(request):
-            return request
-
-        def mock_process_request(request, max_model_len):
-            return request
-
-        vl_processor._apply_default_parameters = mock_apply_default_parameters
-        vl_processor.process_request_dict = mock_process_request
-        result = vl_processor.process_request(mock_request, chat_template="hello")
-        self.assertEqual("hello", result.chat_template)
-
-    @patch("fastdeploy.input.text_processor.DataProcessor.__init__")
-    def test_text_processor_process_request(self, mock_class):
-        mock_class.return_value = None
-        text_processor = DataProcessor()
-        mock_request = Request.from_dict(
-            {"request_id": "123", "prompt": "hi", "max_tokens": 128, "temperature": 1, "top_p": 1}
-        )
-
-        def mock_apply_default_parameters(request):
-            return request
-
-        def mock_process_request(request, max_model_len):
-            return request
-
-        def mock_text2ids(text, max_model_len):
-            return [1]
-
-        text_processor._apply_default_parameters = mock_apply_default_parameters
-        text_processor.process_request_dict = mock_process_request
-        text_processor.text2ids = mock_text2ids
-        text_processor.eos_token_ids = [1]
-        result = text_processor.process_request(mock_request, chat_template="hello")
-        self.assertEqual("hello", result.chat_template)
-
-    @patch("fastdeploy.input.ernie_processor.ErnieProcessor.__init__")
-    def test_ernie_processor_process(self, mock_class):
-        mock_class.return_value = None
-        ernie_processor = ErnieProcessor()
-        mock_request = Request.from_dict(
-            {"request_id": "123", "messages": ["hi"], "max_tokens": 128, "temperature": 1, "top_p": 1}
-        )
-
-        def mock_apply_default_parameters(request):
-            return request
-
-        def mock_process_request(request, max_model_len):
-            return request
-
-        def mock_messages2ids(text):
-            return [1]
-
-        ernie_processor._apply_default_parameters = mock_apply_default_parameters
-        ernie_processor.process_request_dict = mock_process_request
-        ernie_processor.messages2ids = mock_messages2ids
-        ernie_processor.eos_token_ids = [1]
-        result = ernie_processor.process_request(mock_request, chat_template="hello")
-        self.assertEqual("hello", result.chat_template)
-
-    @patch("fastdeploy.entrypoints.llm.LLM.__init__")
-    def test_llm_load(self, mock_class):
-        mock_class.return_value = None
-        llm = LLM()
-        llm.llm_engine = MagicMock()
-        llm.default_sampling_params = MagicMock()
-        llm.chat_template = "hello"
-
-        def mock_run_engine(req_ids, **kwargs):
-            return req_ids
-
-        def mock_add_request(**kwargs):
-            return kwargs.get("chat_template")
-
-        llm._run_engine = mock_run_engine
-        llm._add_request = mock_add_request
-        result = llm.chat(["hello"], sampling_params=SamplingParams(1))
-        self.assertEqual("hello", result)
 
     @patch("fastdeploy.entrypoints.llm.LLM.__init__")
     def test_llm(self, mock_class):

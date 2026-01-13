@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, fields
+from enum import Enum
 from typing import Any, List, Optional, Union
 
-from fastdeploy.utils import llm_logger as logger
+from fastdeploy import envs
 
 
 @dataclass
@@ -98,8 +99,14 @@ class SamplingParams:
     reasoning_max_tokens: Optional[int] = None
     min_tokens: int = 1
     logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None
+    # For logits and logprobs post processing
+    temp_scaled_logprobs: bool = False
+    top_p_normalized_logprobs: bool = False
     bad_words: Optional[List[str]] = None
-    _bad_words_token_ids: Optional[List[int]] = None
+    guided_decoding: Optional[GuidedDecodingParams] = None
+    bad_words_token_ids: Optional[List[int]] = None
+    logits_processors_args: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_dict(cls, req_dict: dict[str, Any]) -> SamplingParams:
@@ -130,7 +137,11 @@ class SamplingParams:
         reasoning_max_tokens=None,
         min_tokens=1,
         logprobs=None,
+        prompt_logprobs=None,
         bad_words=None,
+        guided_decoding=None,
+        bad_words_token_ids=None,
+        logits_processors_args=None,
     ) -> SamplingParams:
         """Create instance from command line arguments"""
         return cls(
@@ -150,14 +161,16 @@ class SamplingParams:
             reasoning_max_tokens=reasoning_max_tokens,
             min_tokens=min_tokens,
             logprobs=logprobs,
+            prompt_logprobs=prompt_logprobs,
             bad_words=bad_words,
+            guided_decoding=guided_decoding,
+            bad_words_token_ids=bad_words_token_ids,
+            logits_processors_args=logits_processors_args,
         )
 
     def __post_init__(self):
         if self.seed is None:
             self.seed = random.randint(0, 922337203685477580)
-        if self.max_tokens is not None and self.reasoning_max_tokens is None:
-            self.reasoning_max_tokens = max(int(self.max_tokens * 0.8), 1)
         self._verify_args()
 
     def _verify_args(self) -> None:
@@ -195,53 +208,38 @@ class SamplingParams:
             raise ValueError(
                 f"min_tokens must be less than or equal to " f"max_tokens={self.max_tokens}, got {self.min_tokens}."
             )
-        if self.logprobs is not None and self.logprobs < 0:
-            raise ValueError(f"logprobs must be non-negative, got {self.logprobs}.")
-        if self.logprobs is not None and self.logprobs > 20:
-            raise ValueError("Invalid value for 'top_logprobs': must be less than or equal to 20.")
+
+        if not envs.FD_USE_GET_SAVE_OUTPUT_V1:  # False (0)
+            if self.logprobs is not None and (self.logprobs < 0 or self.logprobs > 20):
+                raise ValueError("Invalid value for 'top_logprobs': must be between 0 and 20.")
+            if self.prompt_logprobs is not None:
+                raise ValueError("prompt_logprobs is not support when FD_USE_GET_SAVE_OUTPUT_V1 is disabled.")
+        else:  # True (1)
+            if self.logprobs is not None and self.logprobs < -1:
+                raise ValueError(f"logprobs must be a non-negative value or -1, got {self.logprobs}.")
+            if self.prompt_logprobs is not None and self.prompt_logprobs < -1:
+                raise ValueError(f"prompt_logprobs a must be non-negative value or -1, got {self.prompt_logprobs}.")
 
         if not 0 <= self.seed <= 922337203685477580:
             raise ValueError("seed must be in [0, 922337203685477580], got " f"{self.seed}.")
 
-    def update_from_tokenizer(self, tokenizer):
-        """Support bad words"""
-        if self.bad_words is None:
-            return
-        self._bad_words_token_ids = []
-        for bad_word in self.bad_words:
-            # To prohibit words both at the beginning
-            # and in the middle of text
-            # (related to add_prefix_space tokenizer parameter)
-            for add_prefix_space in [False, True]:
-                prefix = " " if add_prefix_space else ""
-                prompt = prefix + bad_word.lstrip()
-                prompt_token_ids = tokenizer.encode(text=prompt, add_special_tokens=False)["input_ids"]
-
-                if len(prompt_token_ids) != 1:
-                    if not add_prefix_space:
-                        logger.warning(
-                            f"Skip bad_words: <{prompt}>."
-                            f"Bad words should be a single token."
-                            f"Got tokens: {prompt_token_ids}."
+        # Verify logits processors arguments
+        if self.logits_processors_args is not None:
+            if self.logits_processors_args.get("logit_bias") is not None:
+                logit_bias = self.logits_processors_args.get("logit_bias")
+                if not isinstance(logit_bias, dict):
+                    raise TypeError(f"logit_bias must be a dict, but got {type(logit_bias)}")
+                elif not all(isinstance(k, int) and isinstance(v, float) for k, v in logit_bias.items()):
+                    # try to cast the dict to the correct type first
+                    try:
+                        cast_logit_bias = {}
+                        for k, v in logit_bias.items():
+                            cast_logit_bias[int(k)] = float(v)
+                        self.logits_processors_args["logit_bias"] = cast_logit_bias
+                    except:
+                        raise TypeError(
+                            "failed to cast logit_bias to the correct {key -> value} type, expected {int -> float}"
                         )
-                    continue
-
-                if prompt_token_ids[0] > tokenizer.vocab_size:
-                    if not add_prefix_space:
-                        logger.warning(
-                            f"Skip bad_words: <{prompt}>."
-                            f"All token id values should be satisfying:"
-                            f" 0 <= token_id < {tokenizer.vocab_size}."
-                            f"Got token: {prompt_token_ids}."
-                        )
-                    continue
-
-                if prompt_token_ids not in self._bad_words_token_ids:
-                    self._bad_words_token_ids.extend(prompt_token_ids)
-
-    @property
-    def bad_words_token_ids(self) -> Optional[List[list[int]]]:
-        return self._bad_words_token_ids
 
 
 @dataclass
@@ -254,3 +252,60 @@ class BeamSearchParams:
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+
+
+@dataclass
+class GuidedDecodingParams:
+    """Guided decoding parameters for text generation."""
+
+    json: Optional[Union[str, dict]] = None
+    regex: Optional[str] = None
+    choice: Optional[List[str]] = None
+    grammar: Optional[str] = None
+    json_object: Optional[bool] = None
+    structural_tag: Optional[str] = None
+
+    def to_dict(self):
+        """convert to dict"""
+        key_dict = {
+            "guided_json": self.json,
+            "guided_regex": self.regex,
+            "guided_choice": self.choice,
+            "guided_grammar": self.grammar,
+            "structural_tag": self.structural_tag,
+            "guided_json_object": self.json_object,
+        }
+
+        guided_dict = {}
+        for key, value in key_dict.items():
+            if value is not None:
+                guided_dict[key] = value
+        return guided_dict
+
+    def __post_init__(self):
+        """Verify the arguments."""
+        guided_count = sum(
+            [
+                self.json is not None,
+                self.regex is not None,
+                self.choice is not None,
+                self.grammar is not None,
+                self.json_object is not None,
+                self.structural_tag is not None,
+            ]
+        )
+
+        if guided_count > 1:
+            raise ValueError(
+                "You can only use one kind of guided decoding "
+                "('json', 'json_object', 'regex', 'choice', 'grammar', 'structural_tag')."
+            )
+
+
+class RequestOutputKind(Enum):
+    # Return entire output so far in every RequestOutput
+    CUMULATIVE = 0
+    # Return only deltas in each RequestOutput
+    DELTA = 1
+    # Do not return intermediate RequestOutput
+    FINAL_ONLY = 2

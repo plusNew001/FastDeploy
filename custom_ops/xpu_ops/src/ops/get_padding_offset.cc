@@ -20,26 +20,26 @@ std::vector<paddle::Tensor> GetPaddingOffset(const paddle::Tensor &input_ids,
                                              const paddle::Tensor &cum_offsets,
                                              const paddle::Tensor &token_num,
                                              const paddle::Tensor &seq_len) {
-    phi::XPUPlace place(phi::backends::xpu::GetXPUCurrentDeviceId());
-    auto dev_ctx =
-        paddle::experimental::DeviceContextPool::Instance().Get(place);
-    auto xpu_ctx = static_cast<const phi::XPUContext *>(dev_ctx);
+  phi::XPUPlace place(phi::backends::xpu::GetXPUCurrentDeviceId());
+  auto dev_ctx = paddle::experimental::DeviceContextPool::Instance().Get(place);
+  auto xpu_ctx = static_cast<const phi::XPUContext *>(dev_ctx);
 
-    std::vector<int64_t> input_ids_shape = input_ids.shape();
-    const int bsz = seq_len.shape()[0];
-    const int seq_length = input_ids_shape[1];
-    auto cum_offsets_out = cum_offsets.copy_to(cum_offsets.place(), false);
-    auto cpu_token_num = token_num.copy_to(paddle::CPUPlace(), false);
+  std::vector<int64_t> input_ids_shape = input_ids.shape();
+  const int bsz = seq_len.shape()[0];
+  const int seq_length = input_ids_shape[1];
+  auto cum_offsets_out = cum_offsets.copy_to(cum_offsets.place(), false);
+  auto cpu_token_num = token_num.copy_to(paddle::CPUPlace(), false);
 
-    const int token_num_data = cpu_token_num.data<int64_t>()[0];
-    auto x_remove_padding = paddle::full(
-        {token_num_data}, 0, paddle::DataType::INT64, input_ids.place());
-    auto batch_id_per_token = paddle::full(
-        {token_num_data}, 0, paddle::DataType::INT32, input_ids.place());
-    auto cu_seqlens_q =
-        paddle::full({bsz + 1}, 0, paddle::DataType::INT32, input_ids.place());
-    auto cu_seqlens_k =
-        paddle::full({bsz + 1}, 0, paddle::DataType::INT32, input_ids.place());
+  const int token_num_data = cpu_token_num.data<int64_t>()[0];
+  auto x_remove_padding = paddle::full(
+      {token_num_data}, 0, paddle::DataType::INT64, input_ids.place());
+  auto batch_id_per_token = paddle::full(
+      {token_num_data}, 0, paddle::DataType::INT32, input_ids.place());
+  auto cu_seqlens_q =
+      paddle::full({bsz + 1}, 0, paddle::DataType::INT32, input_ids.place());
+  auto cu_seqlens_k =
+      paddle::full({bsz + 1}, 0, paddle::DataType::INT32, input_ids.place());
+  if (token_num_data > 0) {
     int r = baidu::xpu::api::plugin::get_padding_offset(
         xpu_ctx->x_context(),
         batch_id_per_token.data<int>(),
@@ -53,11 +53,13 @@ std::vector<paddle::Tensor> GetPaddingOffset(const paddle::Tensor &input_ids,
         seq_length,
         bsz);
     PD_CHECK(r == 0, "baidu::xpu::api::plugin::get_padding_offset failed.");
-    return {x_remove_padding,
-            cum_offsets_out,
-            batch_id_per_token,
-            cu_seqlens_q,
-            cu_seqlens_k};
+  }
+
+  return {x_remove_padding,
+          cum_offsets_out,
+          batch_id_per_token,
+          cu_seqlens_q,
+          cu_seqlens_k};
 }
 
 std::vector<std::vector<int64_t>> GetPaddingOffsetInferShape(
@@ -65,9 +67,9 @@ std::vector<std::vector<int64_t>> GetPaddingOffsetInferShape(
     const std::vector<int64_t> &cum_offsets_shape,
     const std::vector<int64_t> &token_num_shape,
     const std::vector<int64_t> &seq_len_shape) {
-    int64_t bsz = seq_len_shape[0];
-    int64_t seq_len = input_ids_shape[1];
-    return {{-1}, {bsz}, {-1}, {bsz + 1}, {bsz + 1}};
+  int64_t bsz = seq_len_shape[0];
+  int64_t seq_len = input_ids_shape[1];
+  return {{-1}, {bsz}, {-1}, {bsz + 1}, {bsz + 1}};
 }
 
 std::vector<paddle::DataType> GetPaddingOffsetInferDtype(
@@ -75,11 +77,11 @@ std::vector<paddle::DataType> GetPaddingOffsetInferDtype(
     const paddle::DataType &cum_offsets_dtype,
     const paddle::DataType &token_num_dtype,
     const paddle::DataType &seq_len_dtype) {
-    return {input_ids_dtype,
-            seq_len_dtype,
-            seq_len_dtype,
-            seq_len_dtype,
-            seq_len_dtype};
+  return {input_ids_dtype,
+          seq_len_dtype,
+          seq_len_dtype,
+          seq_len_dtype,
+          seq_len_dtype};
 }
 
 PD_BUILD_OP(get_padding_offset)

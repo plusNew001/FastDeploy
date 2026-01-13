@@ -18,6 +18,8 @@ from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
 
+from fastdeploy.utils import llm_logger
+
 
 def shared_memory_exists(name: str) -> bool:
     """Check if a shared memory block with the given name exists.
@@ -35,7 +37,7 @@ def shared_memory_exists(name: str) -> bool:
     except FileNotFoundError:
         return False
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        llm_logger.error(f"Unexpected error: {e}")
         return False
 
 
@@ -53,10 +55,11 @@ class IPCSignal:
     def __init__(
         self,
         name: str,
-        array: np.ndarray,
-        dtype: np.dtype,
+        array: np.ndarray = None,
+        dtype: np.dtype = None,
         suffix: int = None,
         create: bool = True,
+        shm_size: int = None,
     ) -> None:
         """Initialize or connect to a shared memory block.
 
@@ -66,25 +69,45 @@ class IPCSignal:
             dtype: Data type of the array (must match array.dtype).
             suffix: Suffix number that will be appended to the name.
             create: If True, creates new memory block; otherwise connects to existing.
+            shm_size: Size of the shared memory block in bytes.
 
         Raises:
             AssertionError: If create=True but memory already exists, or dtype mismatch.
         """
-        assert isinstance(array, np.ndarray), "Input must be a numpy array"
-        assert dtype == array.dtype, "Specified dtype must match array dtype"
-
         # Set a suffix for name to avoid name conflict while there are multiple engine launched
         if suffix is not None:
             name = name + f".{suffix}"
 
-        if create:
-            assert not shared_memory_exists(name), f"ShareMemory: {name} already exists"
-            self.shm = SharedMemory(create=True, size=array.nbytes, name=name)
-            self.value: np.ndarray = np.ndarray(array.shape, dtype=array.dtype, buffer=self.shm.buf)
-            self.value[:] = array  # Initialize with input array data
+        if dtype is None or array is None:
+            assert shm_size is not None, "shm_size must be specified if array and dtype are None"
+
+            if create:
+                llm_logger.debug(f"creating ipc signal: {name}")
+                if shared_memory_exists(name):
+                    llm_logger.warning(f"ShareMemory: {name} already exists, delete it")
+                    SharedMemory(name=name, create=False).unlink()
+                self.shm = SharedMemory(create=True, size=shm_size, name=name)
+                self.value = None
+            else:
+                llm_logger.debug(f"attaching ipc signal: {name}")
+                self.shm = SharedMemory(name=name)
+                self.value = None
         else:
-            self.shm = SharedMemory(name=name)
-            self.value: np.ndarray = np.ndarray(array.shape, dtype=array.dtype, buffer=self.shm.buf)
+            assert isinstance(array, np.ndarray), "Input must be a numpy array"
+            assert dtype == array.dtype, "Specified dtype must match array dtype"
+
+            if create:
+                llm_logger.debug(f"creating ipc signal: {name}")
+                if shared_memory_exists(name):
+                    llm_logger.warning(f"ShareMemory: {name} already exists, delete it")
+                    SharedMemory(name=name, create=False).unlink()
+                self.shm = SharedMemory(create=True, size=array.nbytes, name=name)
+                self.value: np.ndarray = np.ndarray(array.shape, dtype=array.dtype, buffer=self.shm.buf)
+                self.value[:] = array  # Initialize with input array data
+            else:
+                llm_logger.debug(f"attaching ipc signal: {name}")
+                self.shm = SharedMemory(name=name)
+                self.value: np.ndarray = np.ndarray(array.shape, dtype=array.dtype, buffer=self.shm.buf)
 
     def clear(self) -> None:
         """Release system resources and unlink the shared memory block."""

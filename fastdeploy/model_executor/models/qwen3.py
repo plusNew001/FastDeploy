@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import re
 from functools import partial
 
 import paddle
@@ -32,9 +33,14 @@ from fastdeploy.model_executor.layers.attention.attention import Attention
 from fastdeploy.model_executor.layers.embeddings import VocabParallelEmbedding
 from fastdeploy.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from fastdeploy.model_executor.layers.lm_head import ParallelLMHead
-from fastdeploy.model_executor.layers.normalization import RMSNorm
-from fastdeploy.model_executor.models.model_base import ModelForCasualLM
+from fastdeploy.model_executor.layers.normalization import QKRMSNorm, RMSNorm
+from fastdeploy.model_executor.models.model_base import (
+    ModelCategory,
+    ModelForCasualLM,
+    ModelRegistry,
+)
 from fastdeploy.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP
+from fastdeploy.transformer_utils.config import get_pooling_config
 
 
 class Qwen3MLP(Qwen2MLP):
@@ -51,15 +57,19 @@ class Qwen3Attention(nn.Layer):
 
         self.fd_config = fd_config
         self.head_dim = fd_config.model_config.head_dim
+        tp_size = fd_config.parallel_config.tensor_parallel_size
+        num_kv_heads_replicas = max(1, tp_size // fd_config.model_config.num_key_value_heads)
+        self.q_size = fd_config.model_config.num_attention_heads * self.head_dim // tp_size
+        self.kv_size = fd_config.model_config.num_key_value_heads * self.head_dim * num_kv_heads_replicas // tp_size
 
         self.qkv_proj = QKVParallelLinear(fd_config, prefix=f"{prefix}.qkv_proj", with_bias=False)
-        nranks = fd_config.parallel_config.tensor_parallel_size
 
         self.o_proj = RowParallelLinear(
             fd_config,
             prefix=f"{prefix}.o_proj",
             input_size=fd_config.model_config.head_dim * fd_config.model_config.num_attention_heads,
             output_size=fd_config.model_config.hidden_size,
+            layer_id=layer_id,
         )
 
         self.attn = Attention(
@@ -69,32 +79,21 @@ class Qwen3Attention(nn.Layer):
             use_neox_rotary_style=True,
         )
 
-        self.q_norm = RMSNorm(
+        self.qk_norm = QKRMSNorm(
             fd_config,
-            hidden_size=self.head_dim,
+            head_dim=self.head_dim,
+            q_size=self.q_size,
+            kv_size=self.kv_size,
             eps=fd_config.model_config.rms_norm_eps,
-            prefix=f"{prefix}.q_norm",
+            prefix=prefix,
             begin_norm_axis=2,
         )
-        self.k_norm = RMSNorm(
-            fd_config,
-            hidden_size=self.head_dim,
-            eps=fd_config.model_config.rms_norm_eps,
-            prefix=f"{prefix}.k_norm",
-            begin_norm_axis=2,
-        )
-
-        nranks = fd_config.parallel_config.tensor_parallel_size
-        num_kv_heads_replicas = max(1, nranks // fd_config.model_config.num_key_value_heads)
-        self.q_size = fd_config.model_config.num_attention_heads * self.head_dim // nranks
-        self.kv_size = fd_config.model_config.num_key_value_heads * self.head_dim * num_kv_heads_replicas // nranks
 
     def load_state_dict(self, state_dict):
         """ """
         self.qkv_proj.load_state_dict(state_dict)
         self.o_proj.load_state_dict(state_dict)
-        self.q_norm.load_state_dict(state_dict)
-        self.k_norm.load_state_dict(state_dict)
+        self.qk_norm.load_state_dict(state_dict)
         self.attn.load_state_dict(state_dict)
 
     def forward(
@@ -104,19 +103,7 @@ class Qwen3Attention(nn.Layer):
     ):
         """ """
         qkv_out = self.qkv_proj(hidden_states)
-        # origin_qkv_out = qkv_out
-        q, k, v = qkv_out.split([self.q_size, self.kv_size, self.kv_size], axis=-1)
-
-        q_by_head = q.reshape([*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim])
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.reshape(q.shape)
-
-        k_by_head = k.reshape([*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim])
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.reshape(k.shape)
-
-        qkv_out = paddle.concat([q, k, v], axis=-1)
-
+        qkv_out = self.qk_norm(qkv_out)
         atten_out = self.attn(
             qkv=qkv_out,
             forward_meta=forward_meta,
@@ -203,20 +190,24 @@ class Qwen3Model(nn.Layer):
         forward_meta: ForwardMeta,
     ):
         """ """
-        hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
+        hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
 
         residual = None
 
         for i in range(self.num_layers):
             hidden_states, residual = self.layers[i](forward_meta, hidden_states, residual)
 
-        hidden_states = hidden_states + residual
-
-        out = self.norm(hidden_states)
+        out = self.norm(hidden_states, residual)[0]
 
         return out
 
 
+@ModelRegistry.register_model_class(
+    architecture="Qwen3ForCausalLM",
+    module_name="qwen3",
+    category=[ModelCategory.TEXT_GENERATION],
+    primary_use=ModelCategory.TEXT_GENERATION,
+)
 class Qwen3ForCausalLM(ModelForCasualLM):
     """
     Qwen3ForCausalLM
@@ -254,7 +245,12 @@ class Qwen3ForCausalLM(ModelForCasualLM):
             weights_iterator (Iterator): An iterator yielding (name, weight) pairs.
         """
 
-        from fastdeploy.model_executor.models.utils import default_weight_loader
+        from fastdeploy.model_executor.utils import (
+            default_weight_loader,
+            process_weights_after_loading,
+        )
+
+        is_pooling_model = hasattr(self, "is_pooling_model") and self.is_pooling_model
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -265,9 +261,21 @@ class Qwen3ForCausalLM(ModelForCasualLM):
             ("up_gate_proj", "up_proj", "up"),
             ("embed_tokens.embeddings", "embed_tokens", None),
             ("lm_head.linear", "lm_head", None),
+            ("qk_norm.q_norm", "q_norm", None),
+            ("qk_norm.k_norm", "k_norm", None),
         ]
 
         params_dict = dict(self.named_parameters())
+        model_path = self.fd_config.model_config.model
+        revision = self.fd_config.model_config.revision
+        if is_pooling_model and get_pooling_config(model_path, revision):
+            params_dict = {
+                param_name[6:] if param_name.startswith("model.") else param_name: param
+                for param_name, param in params_dict.items()
+            }
+
+        process_weights_after_loading_fn = process_weights_after_loading(dict(self.named_sublayers()), self.fd_config)
+
         for loaded_weight_name, loaded_weight in weights_iterator:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in loaded_weight_name:
@@ -276,18 +284,27 @@ class Qwen3ForCausalLM(ModelForCasualLM):
                 if model_param_name not in params_dict:
                     continue
                 param = params_dict[model_param_name]
+
                 weight_loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
+
                 weight_loader(param, loaded_weight, shard_id)
+
                 break
             else:
-                if loaded_weight_name not in params_dict:
+                model_param_name = loaded_weight_name
+                if model_param_name not in params_dict:
                     continue
-                param = params_dict[loaded_weight_name]
+                param = params_dict[model_param_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
                 weight_loader(param, loaded_weight)
 
-        if self.tie_word_embeddings:
-            self.lm_head.linear.weight.set_value(self.model.embed_tokens.embeddings.weight.transpose([1, 0]))
+            model_sublayer_name = re.sub(r"\.(weight)$", "", model_param_name)
+            process_weights_after_loading_fn(model_sublayer_name, param)
+
+        if self.tie_word_embeddings and not is_pooling_model:
+            self.lm_head.linear.weight.set_value(
+                self.model.embed_tokens.embeddings.weight.transpose([1, 0]).astype(self.lm_head.linear.weight.dtype)
+            )
 
     @paddle.no_grad()
     def set_state_dict(self, state_dict):
@@ -301,14 +318,14 @@ class Qwen3ForCausalLM(ModelForCasualLM):
         """
         self.model.load_state_dict(state_dict)
         if self.tie_word_embeddings:
-            self.lm_head.linear.weight.set_value(self.model.embed_tokens.embeddings.weight.transpose([1, 0]))
+            self.lm_head.load_state_dict({self.lm_head.weight_key: self.model.embed_tokens.embeddings.weight})
         else:
             self.lm_head.load_state_dict(state_dict)
 
     def compute_logits(self, hidden_states: paddle.Tensor):
         """ """
         logits = self.lm_head(hidden_states)
-        logits = paddle.cast(logits, paddle.float32)
+        logits = logits.astype(paddle.float32)
         logits[:, self.ori_vocab_size :] = -float("inf")
 
         return logits
@@ -322,6 +339,10 @@ class Qwen3ForCausalLM(ModelForCasualLM):
         hidden_states = self.model(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
 
         return hidden_states
+
+    def clear_grpah_opt_backend(self):
+        """Clear graph optimization backend, the captured cuda graph will be cleaned"""
+        self.model.clear_grpah_opt_backend(fd_config=self.fd_config)
 
 
 class Qwen3PretrainedModel(PretrainedModel):
@@ -348,7 +369,7 @@ class Qwen3PretrainedModel(PretrainedModel):
 
         fn = split_or_merge_func(
             is_split=is_split,
-            tensor_parallel_degree=config.tensor_parallel_degree,
+            tensor_model_parallel_size=config.tensor_model_parallel_size,
             tensor_parallel_rank=config.tensor_parallel_rank,
             num_attention_heads=config.num_attention_heads,
         )
@@ -369,7 +390,7 @@ class Qwen3PretrainedModel(PretrainedModel):
             base_actions["layers.0.self_attn.q_proj.weight"] = partial(fn, is_column=True)
             base_actions["layers.0.self_attn.q_proj.bias"] = partial(fn, is_column=True)
             # if we have enough num_key_value_heads to split, then split it.
-            if config.num_key_value_heads % config.tensor_parallel_degree == 0:
+            if config.num_key_value_heads % config.tensor_model_parallel_size == 0:
                 base_actions["layers.0.self_attn.k_proj.weight"] = partial(fn, is_column=True)
                 base_actions["layers.0.self_attn.v_proj.weight"] = partial(fn, is_column=True)
 

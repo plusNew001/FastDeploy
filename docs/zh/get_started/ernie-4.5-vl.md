@@ -1,3 +1,5 @@
+[English](../../get_started/ernie-4.5-vl.md)
+
 # ERNIE-4.5-VL多模态模型
 
 本文档讲解如何部署ERNIE-4.5-VL多模态模型，支持用户使用多模态数据与模型进行对话交互(包含思考Reasoning)，在开始部署前，请确保你的硬件环境满足如下条件：
@@ -27,7 +29,7 @@ export ENABLE_V1_KVCACHE_SCHEDULER=1
 python -m fastdeploy.entrypoints.openai.api_server \
        --model baidu/ERNIE-4.5-VL-424B-A47B-Paddle \
        --port 8180 --engine-worker-queue-port 8181 \
-       --cache-queue-port 8182 --metrics-port 8182 \
+       --cache-queue-port 8183 --metrics-port 8182 \
        --tensor-parallel-size 8 \
        --quantization wint4 \
        --max-model-len 32768 \
@@ -67,7 +69,7 @@ curl -X POST "http://0.0.0.0:8180/v1/chat/completions" \
   ]
 }'
 ```
-
+\
 输入包含图片时，按如下命令发起请求
 
 ```shell
@@ -82,7 +84,15 @@ curl -X POST "http://0.0.0.0:8180/v1/chat/completions" \
   ]
 }'
 ```
-
+图片url字段同样支持传入base64编码字符串:
+```shell
+{"type":"image_url", "image_url": {"url":"data:image/jpg;base64,this/is/an/example"}
+```
+或本地文件的绝对路径:
+```shell
+{"type":"image_url", "image_url": {"url":"file:///this/is/an/example"}
+```
+\
 输入包含视频时，按如下命令发起请求
 
 ```shell
@@ -97,7 +107,15 @@ curl -X POST "http://0.0.0.0:8180/v1/chat/completions" \
   ]
 }'
 ```
-
+视频url字段同样支持传入base64编码字符串:
+```shell
+{"type":"video_url", "video_url": {"url":"data:video/mp4;base64,this/is/an/example"}
+```
+或本地文件的绝对路径:
+```shell
+{"type":"video_url", "video_url": {"url":"file:///this/is/an/example"}
+```
+\
 当前ERNIE-4.5-VL模型支持思考模式且默认开启，按如下命令可关闭思考模式
 
 ```shell

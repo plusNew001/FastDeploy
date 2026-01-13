@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 
-"""redundant expert manger."""
+"""redundant expert manager."""
 from typing import Optional, Tuple
 
 import numpy as np
@@ -42,7 +42,7 @@ class RedundantExpertManger:
         self.num_hidden_layers = num_hidden_layers
 
         self.num_replicas = self.num_expert + self.redundant_experts_num
-        self.num_nodes = max(ep_size // 8, 1)
+        self.num_nodes = max(ep_size // 8, 8)
         self.num_gpus = ep_size
         self.num_groups = 1
 

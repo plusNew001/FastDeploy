@@ -16,6 +16,7 @@
 
 import multiprocessing
 import os
+from typing import Callable
 
 import numpy as np
 import paddle
@@ -49,7 +50,7 @@ class GCUFusedMoeMethod(UnquantizedFusedMoEMethod):
         self.group_size = -1
 
     def process_loaded_weights(self, layer: nn.Layer, state_dict):
-        up_gate_proj_weights, down_proj_weights = layer.extract_moe_ffn_weights(state_dict)
+        up_gate_proj_weights, down_proj_weights, _, _ = layer.extract_moe_ffn_weights(state_dict)
         stacked_up_gate_proj_weights = paddle.stack(up_gate_proj_weights, axis=0)
         stacked_down_proj_weights = paddle.stack(down_proj_weights, axis=0)
         layer.up_gate_proj_weight.set_value(paddle.transpose(stacked_up_gate_proj_weights, [0, 2, 1]))
@@ -175,13 +176,6 @@ class GCUFusedMoeMethod(UnquantizedFusedMoEMethod):
         fused_moe_out = intermediate_cache3.sum(axis=1)
         fused_moe_out = fused_moe_out.reshape_([token_num, hidden_size])
 
-        if layer.tp_size > 1:
-            from fastdeploy.distributed.communication import (
-                tensor_model_parallel_all_reduce,
-            )
-
-            tensor_model_parallel_all_reduce(fused_moe_out)
-
         return fused_moe_out
 
     def apply(
@@ -189,6 +183,7 @@ class GCUFusedMoeMethod(UnquantizedFusedMoEMethod):
         layer: nn.Layer,
         x: paddle.Tensor,
         gate: nn.Layer,
+        topk_ids_hookfunc: Callable = None,
     ) -> paddle.Tensor:
         """
         Paddle gcu compute Fused MoE.
@@ -201,6 +196,7 @@ class GCUFusedMoeMethod(UnquantizedFusedMoEMethod):
         layer: nn.Layer,
         x: paddle.Tensor,
         gate: nn.Layer,
+        topk_ids_hookfunc: Callable = None,
     ) -> paddle.Tensor:
         """
         Apply the EP prefill method.
@@ -212,6 +208,7 @@ class GCUFusedMoeMethod(UnquantizedFusedMoEMethod):
         layer: nn.Layer,
         x: paddle.Tensor,
         gate: nn.Layer,
+        topk_ids_hookfunc: Callable = None,
     ) -> paddle.Tensor:
         """
         Apply the EP decoder method.
@@ -223,6 +220,7 @@ class GCUFusedMoeMethod(UnquantizedFusedMoEMethod):
         layer: nn.Layer,
         x: paddle.Tensor,
         gate: nn.Layer,
+        topk_ids_hookfunc: Callable = None,
     ) -> paddle.Tensor:
         """
         Paddle Cutlass compute Fused MoE.
@@ -254,7 +252,7 @@ class GCUWeightOnlyMoEMethod(GCUFusedMoeMethod):
         self.quant_multi_process_group_size = int(os.getenv("FD_MOE_QUANT_MULTI_PROCESS_GROUP_SIZE", 8))
         logger.info(f"GCUWeightOnlyMoEMethod quant_multi_process_group_size: {self.quant_multi_process_group_size}")
 
-    def process_prequanted_weights(self, layer: nn.Layer, state_dict):
+    def process_prequanted_weights(self, layer: nn.Layer, state_dict, is_rearrange: bool = False):
         """
         Paddle gcu process prequanted weights.
         """
@@ -299,7 +297,7 @@ class GCUWeightOnlyMoEMethod(GCUFusedMoeMethod):
         """
         Paddle cutlass create weight process.
         """
-        up_gate_proj_weights, down_proj_weights = layer.extract_moe_ffn_weights(state_dict)
+        up_gate_proj_weights, down_proj_weights, _, _ = layer.extract_moe_ffn_weights(state_dict)
         self.check(layer, up_gate_proj_weights, down_proj_weights)
 
         def quant_worker(p_group_idx, shared_dict, weights, moe_quant_type, group_size):
@@ -388,6 +386,7 @@ class GCUWeightOnlyMoEMethod(GCUFusedMoeMethod):
         layer: nn.Layer,
         x: paddle.Tensor,
         gate: nn.Layer,
+        topk_ids_hookfunc: Callable = None,
     ) -> paddle.Tensor:
         """
         Paddle gcu compute Fused MoE.

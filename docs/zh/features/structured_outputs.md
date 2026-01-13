@@ -1,3 +1,5 @@
+[English](../../features/structured_outputs.md)
+
 # Structured Outputs
 
 ## 概述
@@ -5,6 +7,7 @@
 Structured Outputs 是指通过预定义格式约束，使大模型生成内容严格遵循指定结构。该功能可显著提升生成结果的可控性，适用于需要精确格式输出的场景（如API调用、数据解析、代码生成等），同时支持动态语法扩展，平衡灵活性与规范性。
 
 FastDeploy 支持使用 [XGrammar](https://xgrammar.mlc.ai/docs/) 后端生成结构化输出。
+FastDeploy 支持使用 [LLguidance](https://github.com/guidance-ai/llguidance) 后端生成结构化输出。
 
 支持输出格式
 
@@ -329,4 +332,68 @@ ParsedChatCompletionMessage[Info](content='{"addr": "上海市浦东新区世纪
 
 地址: 上海市浦东新区世纪大道1号
 高度: 468
+```
+
+### 离线推理
+
+离线推理允许通过预先指定约束条件，限制模型输出格式。在 `FastDeploy` 中，支持通过 `SamplingParams` 中的 `GuidedDecodingParams` 类指定相关约束条件。`GuidedDecodingParams` 支持以下几种约束条件，使用方式可以参考在线推理：
+
+```python
+json: Optional[Union[str, dict]] = None
+regex: Optional[str] = None
+choice: Optional[List[str]] = None
+grammar: Optional[str] = None
+json_object: Optional[bool] = None
+structural_tag: Optional[str] = None
+```
+
+以下示例展示了如何使用离线推理生成一个结构化的 json :
+
+```python
+
+from fastdeploy import LLM, SamplingParams
+from fastdeploy.engine.sampling_params import GuidedDecodingParams
+from pydantic import BaseModel
+from enum import Enum
+
+class BookType(str, Enum):
+    romance = "Romance"
+    historical = "Historical"
+    adventure = "Adventure"
+    mystery = "Mystery"
+    dystopian = "Dystopian"
+
+class BookDescription(BaseModel):
+    author: str
+    title: str
+    genre: BookType
+
+# Constrained decoding parameters
+guided_decoding_params = GuidedDecodingParams(json=BookDescription.model_json_schema())
+
+# Sampling parameters
+sampling_params = SamplingParams(
+    top_p=0.95,
+    max_tokens=6400,
+    guided_decoding=guided_decoding_params,
+)
+
+# Load model
+llm = LLM(model="ERNIE-4.5-0.3B", tensor_parallel_size=1, max_model_len=8192, guided_decoding_backend="auto")
+
+outputs = llm.generate(
+    prompts="生成一个JSON，描述一本中国的著作，要包含作者、标题和书籍类型。",
+    sampling_params=sampling_params,
+)
+
+# Output results
+for output in outputs:
+    print(output.outputs.text)
+
+```
+
+输出
+
+```
+{"author": "曹雪芹", "title": "红楼梦", "genre": "Historical"}
 ```

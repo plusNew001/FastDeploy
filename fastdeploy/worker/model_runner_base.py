@@ -15,6 +15,8 @@
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
 
 from paddle import nn
 
@@ -23,6 +25,18 @@ from fastdeploy.utils import get_logger
 from fastdeploy.worker.output import ModelRunnerOutput
 
 logger = get_logger("model_runner_base", "model_runner_base.log")
+
+
+@dataclass
+class DistributedStatus:
+    only_decode: bool = True
+    moe_num_chunk: int = 1
+
+
+@dataclass
+class DistributedOut:
+    if_only_decode: bool = True
+    max_moe_num_chunk: Optional[int] = None
 
 
 class ModelRunnerBase(ABC):
@@ -45,6 +59,7 @@ class ModelRunnerBase(ABC):
         self.graph_opt_config = fd_config.graph_opt_config
         self.quant_config = fd_config.quant_config
         self.cache_config = fd_config.cache_config
+        self.scheduler_config = fd_config.scheduler_config
         # ... config
 
         self.device = device
@@ -78,3 +93,9 @@ class ModelRunnerBase(ABC):
         Execute a forward pass with dummy inputs to profile the memory usage of the model."
         """
         raise NotImplementedError
+
+    def vision_encoder_compile(self):
+        """
+        Compile the vision encoder if applicable
+        """
+        logger.info(f"No vision encoder compilation for base {self.__class__.__name__}")

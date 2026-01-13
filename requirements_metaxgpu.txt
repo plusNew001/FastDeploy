@@ -8,9 +8,10 @@ aiozmq
 openai>=1.93.0
 tqdm
 pynvml
-uvicorn
+uvicorn==0.29.0
 fastapi
-paddleformers
+# if paddleformers version > 0.3.2, metax triton will be replaced by the newest triton.
+paddleformers==0.3.2
 redis
 etcd3
 httpx
@@ -28,13 +29,20 @@ moviepy
 triton
 use-triton-in-paddle
 crcmod
-fastsafetensors==0.1.14
+safetensors>=0.7.0
 msgpack
+gunicorn
+modelscope
 opentelemetry-api>=1.24.0
 opentelemetry-sdk>=1.24.0
 opentelemetry-instrumentation-redis
 opentelemetry-instrumentation-mysql
-opentelemetry-distro 
+opentelemetry-distro
 opentelemetry-exporter-otlp
 opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-logging>=0.57b0
 partial_json_parser
+msgspec
+einops
+setproctitle
+aistudio_sdk

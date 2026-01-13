@@ -32,6 +32,7 @@ on:
 jobs:
   run_tests_logprob:
     runs-on: [self-hosted, GPU-h20-1Cards]
+    timeout-minutes: 60
     steps:
       - name: Code Prepare
         shell: bash
@@ -39,20 +40,43 @@ jobs:
           docker_image: ${{ inputs.DOCKER_IMAGE }}
           paddletest_archive_url: ${{ inputs.PADDLETEST_ARCHIVE_URL }}
         run: |
-            # Clean the repository directory before starting
-            docker run --rm --net=host -v $(pwd):/workspace -w /workspace \
-            -e "REPO_NAME=${REPO_NAME}" \
-            -e "BASE_BRANCH=${BASE_BRANCH}" \
-            ${docker_image} /bin/bash -c '
-            rm -rf /workspace/*
-            '
-            wget -q ${paddletest_archive_url}
-            tar -xf PaddleTest.tar.gz
-            rm -rf PaddleTest.tar.gz
-            cd PaddleTest
-            git config --global user.name "FastDeployCI"
-            git config --global user.email "fastdeploy_ci@example.com"
-            git log -n 3 --oneline
+          docker pull ${docker_image}
+          # Clean the repository directory before starting
+          docker run --rm --net=host -v $(pwd):/workspace -w /workspace \
+          -e "REPO_NAME=${REPO_NAME}" \
+          -e "BASE_BRANCH=${BASE_BRANCH}" \
+          ${docker_image} /bin/bash -c '
+            CLEAN_RETRIES=3
+            CLEAN_COUNT=0
+
+            while [ $CLEAN_COUNT -lt $CLEAN_RETRIES ]; do
+              echo "Attempt $((CLEAN_COUNT+1)) to remove /workspace/* ..."
+              rm -rf /workspace/* || true
+              sleep 2
+
+              # Check if anything matching /workspace/* still exists
+              if ! ls /workspace/* >/dev/null 2>&1; then
+                echo "All /workspace/* removed successfully"
+                break
+              fi
+
+              CLEAN_COUNT=$((CLEAN_COUNT + 1))
+            done
+
+            if ls /workspace/* >/dev/null 2>&1; then
+              echo "ERROR: Failed to clean /workspace/* after multiple attempts"
+              ls -ld /workspace/*
+              exit 1
+            fi
+          '
+          wget -q --no-proxy ${paddletest_archive_url}
+          tar -xf PaddleTest.tar.gz
+          rm -rf PaddleTest.tar.gz
+          cd PaddleTest
+          git config --global user.name "FastDeployCI"
+          git config --global user.email "fastdeploy_ci@example.com"
+          git log -n 3 --oneline
+
       - name: logprob test
         shell: bash
         env:
@@ -66,16 +90,18 @@ jobs:
           DEVICES=$(echo "$CARD_ID" | fold -w1 | paste -sd,)
           DEVICE_PORT=$(echo "$DEVICES" | cut -d',' -f1)
 
-          FLASK_PORT=$((42068 + DEVICE_PORT * 100))
-          FD_API_PORT=$((42088 + DEVICE_PORT * 100))
-          FD_ENGINE_QUEUE_PORT=$((42058 + DEVICE_PORT * 100))
-          FD_METRICS_PORT=$((42078 + DEVICE_PORT * 100))
+          FLASK_PORT=$((8068 + DEVICE_PORT * 100))
+          FD_API_PORT=$((8088 + DEVICE_PORT * 100))
+          FD_ENGINE_QUEUE_PORT=$((8058 + DEVICE_PORT * 100))
+          FD_METRICS_PORT=$((8078 + DEVICE_PORT * 100))
+          FD_CACHE_QUEUE_PORT=$((8098 + DEVICE_PORT * 100))
           echo "Test ENV Parameter:"
           echo "========================================================="
           echo "FLASK_PORT=${FLASK_PORT}"
           echo "FD_API_PORT=${FD_API_PORT}"
           echo "FD_ENGINE_QUEUE_PORT=${FD_ENGINE_QUEUE_PORT}"
           echo "FD_METRICS_PORT=${FD_METRICS_PORT}"
+          echo "FD_CACHE_QUEUE_PORT=${FD_CACHE_QUEUE_PORT}"
           echo "DEVICES=${DEVICES}"
           echo "========================================================="
 
@@ -89,7 +115,7 @@ jobs:
             exit 1
           fi
 
-          PORTS=($FLASK_PORT $FD_API_PORT $FD_ENGINE_QUEUE_PORT $FD_METRICS_PORT)
+          PORTS=($FLASK_PORT $FD_API_PORT $FD_ENGINE_QUEUE_PORT $FD_METRICS_PORT $FD_CACHE_QUEUE_PORT)
           LOG_FILE="./port_cleanup_$(date +%Y%m%d_%H%M%S).log"
           echo "==== LOG_FILE is ${LOG_FILE} ===="
 
@@ -108,13 +134,21 @@ jobs:
 
           echo "==== PORT CLEAN COMPLETE ====" | tee -a $LOG_FILE
 
+          echo "========================================================="
+          echo "Ensuring no stale container named ${runner_name} ..."
+          if [ "$(docker ps -a -q -f name=${runner_name})" ]; then
+            echo "Removing stale container: ${runner_name}"
+            docker rm -f ${runner_name} || true
+          fi
           docker run --rm --ipc=host --pid=host --net=host \
+          --name ${runner_name} \
           -v $(pwd):/workspace \
           -w /workspace \
           -e fastdeploy_wheel_url=${fastdeploy_wheel_url} \
           -e "FD_API_PORT=${FD_API_PORT}" \
           -e "FD_ENGINE_QUEUE_PORT=${FD_ENGINE_QUEUE_PORT}" \
           -e "FD_METRICS_PORT=${FD_METRICS_PORT}" \
+          -e "FD_CACHE_QUEUE_PORT=${FD_CACHE_QUEUE_PORT}" \
           -e "FLASK_PORT=${FLASK_PORT}" \
           -v "${MODEL_CACHE_DIR}:/MODELDATA" \
           -v "${CACHE_DIR}/gitconfig:/etc/gitconfig:ro" \
@@ -128,14 +162,16 @@ jobs:
 
           python -m pip install ${fastdeploy_wheel_url}
 
-          wget https://paddle-qa.bj.bcebos.com/zhengtianyu/tools/llm-deploy-linux-amd64
+          wget --no-proxy https://paddle-qa.bj.bcebos.com/zhengtianyu/tools/llm-deploy-linux-amd64
           chmod +x ./llm-deploy-linux-amd64
           ./llm-deploy-linux-amd64 -python python3.10 \
           -model_name ERNIE-4.5-0.3B-Paddle \
           -model_path /MODELDATA \
-          --skip install
+          --skip install,model
 
           cd PaddleTest/framework/ServeTest
+          ps -ef | grep "${FD_CACHE_QUEUE_PORT}" | grep -v grep | awk "{print \$2}" | xargs -r kill -9
+          ps -ef | grep "${FD_ENGINE_QUEUE_PORT}" | grep -v grep | awk "{print \$2}" | xargs -r kill -9
           python3.10 deploy.py > dd.log 2>&1 &
           sleep 3
           curl -X POST http://0.0.0.0:${FLASK_PORT}/start \

@@ -64,6 +64,12 @@ class CUDAPlatform(Platform):
         elif selected_backend == _Backend.FLASH_ATTN:
             logger.info("Using FLASH ATTN backend.")
             return "fastdeploy.model_executor.layers.attention.FlashAttentionBackend"
+        elif selected_backend == _Backend.PLAS_ATTN:
+            logger.info("Using PLAS ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.PlasAttentionBackend"
+        elif selected_backend == _Backend.FLASH_MASK_ATTN:
+            logger.info("Using FLASH MASK ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.FlashMaskAttentionBackend"
         else:
             raise ValueError(
                 "Invalid attention backend you specified.\n"

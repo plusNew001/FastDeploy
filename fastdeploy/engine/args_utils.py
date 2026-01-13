@@ -14,26 +14,44 @@
 # limitations under the License.
 """
 
+import argparse
 import json
 import os
 from dataclasses import asdict, dataclass
 from dataclasses import fields as dataclass_fields
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
+from fastdeploy import envs
 from fastdeploy.config import (
     CacheConfig,
+    ConvertOption,
     EarlyStopConfig,
+    EPLBConfig,
+    FDConfig,
     GraphOptimizationConfig,
     LoadConfig,
     ModelConfig,
     ParallelConfig,
+    PlasAttentionConfig,
+    PoolerConfig,
+    RouterConfig,
+    RoutingReplayConfig,
+    RunnerOption,
     SpeculativeConfig,
+    StructuredOutputsConfig,
     TaskOption,
 )
-from fastdeploy.engine.config import Config
 from fastdeploy.platforms import current_platform
 from fastdeploy.scheduler.config import SchedulerConfig
-from fastdeploy.utils import DeprecatedOptionWarning, FlexibleArgumentParser
+from fastdeploy.utils import (
+    DeprecatedOptionWarning,
+    FlexibleArgumentParser,
+    console_logger,
+    find_free_ports,
+    is_port_available,
+    parse_ports,
+    parse_quantization,
+)
 
 
 def nullable_str(x: str) -> Optional[str]:
@@ -43,12 +61,30 @@ def nullable_str(x: str) -> Optional[str]:
     return x if x else None
 
 
+def get_model_architecture(model: str, model_config_name: Optional[str] = "config.json") -> Optional[str]:
+    config_path = os.path.join(model, model_config_name)
+    if os.path.exists(config_path):
+        model_config = json.load(open(config_path, "r", encoding="utf-8"))
+        architecture = model_config["architectures"][0]
+        return architecture
+    else:
+        return model
+
+
 @dataclass
 class EngineArgs:
     # Model configuration parameters
     model: str = "baidu/ernie-45-turbo"
     """
     The name or path of the model to be used.
+    """
+    port: Optional[str] = None
+    """
+    Port for api server.
+    """
+    served_model_name: Optional[str] = None
+    """
+    The name of the model being served.
     """
     revision: Optional[str] = "master"
     """
@@ -61,6 +97,10 @@ class EngineArgs:
     tokenizer: str = None
     """
     The name or path of the tokenizer (defaults to model path if not provided).
+    """
+    tokenizer_base_url: str = None
+    """
+    The base URL of the remote tokenizer service (used instead of local tokenizer if provided).
     """
     max_model_len: int = 2048
     """
@@ -78,6 +118,20 @@ class EngineArgs:
     """
     The task to be executed by the model.
     """
+    runner: RunnerOption = "auto"
+    """
+    The type of model runner to use.Each FD instance only supports one model runner.
+    even if the same model can be used for multiple types.
+    """
+    convert: ConvertOption = "auto"
+    """
+    Convert the model using adapters. The most common use case is to
+    adapt a text generation model to be used for pooling tasks.
+    """
+    override_pooler_config: Optional[Union[dict, PoolerConfig]] = None
+    """
+    Override configuration for the pooler.
+    """
     max_num_seqs: int = 8
     """
     Maximum number of sequences per iteration.
@@ -89,6 +143,14 @@ class EngineArgs:
     limit_mm_per_prompt: Optional[Dict[str, Any]] = None
     """
     Limitation of numbers of multi-modal data.
+    """
+    max_encoder_cache: int = -1
+    """
+    Maximum number of tokens in the encoder cache.
+    """
+    max_processor_cache: float = -1
+    """
+    Maximum number of bytes(in GiB) in the processor cache.
     """
     reasoning_parser: str = None
     """
@@ -118,11 +180,11 @@ class EngineArgs:
     """
     dynamic load weight
     """
-    load_strategy: str = "ipc_snapshot"
+    load_strategy: str = "normal"
     """
     dynamic load weight strategy
     """
-    quantization: str = None
+    quantization: Optional[Dict[str, Any]] = None
     guided_decoding_backend: str = "off"
     """
     Guided decoding backend.
@@ -149,8 +211,7 @@ class EngineArgs:
     """
     Ratio of tokens to process in a block.
     """
-
-    prealloc_dec_block_slot_num_threshold: int = 5
+    prealloc_dec_block_slot_num_threshold: int = 12
     """
     Token slot threshold for preallocating decoder blocks.
     """
@@ -165,9 +226,17 @@ class EngineArgs:
     The amount of CPU memory to offload to.
     """
 
-    cache_queue_port: int = 8003
+    cache_queue_port: Optional[Union[int, str, list]] = None
     """
     Port for cache queue.
+    """
+    kvcache_storage_backend: str = None
+    """
+    The storage backend for kvcache storage. If set, it will use the kvcache storage backend.
+    """
+    write_policy: str = "write_through"
+    """
+    The policy of write cache to storage.
     """
 
     # System configuration parameters
@@ -175,17 +244,44 @@ class EngineArgs:
     """
     Flag to indicate whether to use warm-up before inference.
     """
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool = True
     """
     Flag to enable prefix caching.
     """
-
-    enable_custom_all_reduce: bool = False
+    enable_output_caching: bool = False
     """
-    Flag to enable the custom all-reduce kernel.
+    Flag to enable kv cache for output tokens, only valid in V1 scheduler.
     """
 
-    engine_worker_queue_port: int = 8002
+    disable_custom_all_reduce: bool = False
+    """
+    Flag to disable the custom all-reduce kernel.
+    """
+
+    use_internode_ll_two_stage: bool = False
+    """
+    Flag to use the internode_ll_two_stage kernel.
+    """
+
+    disable_sequence_parallel_moe: bool = False
+    """
+    # The all_reduce at the end of attention (during o_proj) means that
+    # inputs are replicated across each rank of the tensor parallel group.
+    # If using expert-parallelism with DeepEP All2All ops, replicated
+    # tokens results in useless duplicate computation and communication.
+    #
+    # In this case, ensure the input to the experts is sequence parallel
+    # to avoid the excess work.
+    #
+    # This optimization is enabled by default, and can be disabled by using this flag.
+    """
+
+    shutdown_comm_group_if_worker_idle: bool = None
+    """
+    Whether to shutdown the comm group when the weight is cleared.
+    """
+
+    engine_worker_queue_port: Optional[Union[int, str, list]] = None
     """
     Port for worker queue communication.
     """
@@ -200,27 +296,37 @@ class EngineArgs:
     Number of data parallelism.
     """
 
+    local_data_parallel_id: int = 0
+    """
+    Local data parallel id.
+    """
+
     enable_expert_parallel: bool = False
     """
     Enable expert parallelism.
     """
 
-    cache_transfer_protocol: str = "ipc"
+    enable_chunked_moe: bool = False
+    """
+    Whether use chunked moe.
+    """
+
+    chunked_moe_size: int = 256
+    """
+    Chunk size of moe input.
+    """
+
+    cache_transfer_protocol: str = "ipc,rdma"
     """
     Protocol to use for cache transfer.
     """
 
-    pd_comm_port: Optional[List[int]] = None
+    pd_comm_port: Optional[Union[int, str, list]] = None
     """
     Port for splitwise communication.
     """
 
-    innode_prefill_ports: Optional[List[int]] = None
-    """
-    Ports for innode dispatch request.
-    """
-
-    rdma_comm_ports: Optional[List[int]] = None
+    rdma_comm_ports: Optional[Union[int, str, list]] = None
     """
     Ports for rdma communication.
     """
@@ -245,6 +351,10 @@ class EngineArgs:
     static_decode_blocks: int = 2
     """
     additional decode block num
+    """
+    disable_chunked_mm_input: bool = False
+    """
+    Disable chunked_mm_input for multi-model inference.
     """
 
     scheduler_name: str = "local"
@@ -315,19 +425,34 @@ class EngineArgs:
     """
     SplitWise Use, Results Writer Batch Size
     """
-    use_cudagraph: bool = False
-    """
-    Flags to enable Cuda Graph
-    """
     graph_optimization_config: Optional[Dict[str, Any]] = None
     """
     Configuration for graph optimization backend execution.
+    """
+    plas_attention_config: Optional[Dict[str, Any]] = None
+    """
+    Configuration for plas attention.
     """
 
     enable_logprob: bool = False
     """
     Flag to enable logprob output. Default is False (disabled).
     Must be explicitly enabled via the `--enable-logprob` startup parameter to output logprob values.
+    """
+
+    max_logprobs: int = 20
+    """
+    Maximum number of log probabilities to return when `enable_logprob` is True. The default value comes the default for the
+    OpenAI Chat Completions API. -1 means no cap, i.e. all (output_length * vocab_size) logprobs are allowed to be returned and it may cause OOM.
+    """
+
+    logprobs_mode: str = "raw_logprobs"
+    """
+    Indicates the content returned in the logprobs.
+    Supported mode:
+    1) raw_logprobs, 2) processed_logprobs, 3) raw_logits, 4) processed_logits.
+    Raw means the values before applying logit processors, like bad words.
+    Processed means the values after applying such processors.
     """
 
     seed: int = 0
@@ -345,26 +470,178 @@ class EngineArgs:
     Configuration for early stop.
     """
 
-    load_choices: str = "default"
+    load_choices: str = "default_v1"
     """The format of the model weights to load.
         Options include:
         - "default": default loader.
-        - "new_loader": new  loader.
+        - "default_v1": default_v1 loader.
+    """
+
+    lm_head_fp32: bool = False
+    """
+    Flag to specify the dtype of lm_head as FP32. Default is False (Using model default dtype).
+    """
+
+    logits_processors: Optional[List[str]] = None
+    """
+    A list of FQCNs (Fully Qualified Class Names) of logits processors supported by the service.
+    A fully qualified class name (FQCN) is a string that uniquely identifies a class within a Python module.
+
+    - To enable builtin logits processors, add builtin module paths and class names to the list. Currently support:
+        - fastdeploy.model_executor.logits_processor:LogitBiasLogitsProcessor
+    - To enable custom logits processors, add your dotted paths to module and class names to the list.
+    """
+
+    router: Optional[str] = None
+    """
+    Url for router server, such as `0.0.0.0:30000`.
+    """
+
+    enable_eplb: bool = False
+    """
+    Flag to enable eplb
+    """
+
+    eplb_config: Optional[Dict[str, Any]] = None
+    """
+    Configuration for eplb.
+    """
+
+    routing_replay_config: Optional[Dict[str, Any]] = None
+    """
+    Flag to rollout routing replay(r3)
+    """
+
+    skip_port_check: bool = False
+    """
+    Whether to skip port availability check. Default is False (not skip).
+    """
+
+    enable_entropy: bool = False
+    """
+    Flag to enable entropy output. Default is False (disabled).
     """
 
     def __post_init__(self):
         """
         Post-initialization processing to set default tokenizer if not provided.
         """
+
         if not self.tokenizer:
             self.tokenizer = self.model
+        if self.splitwise_role == "decode":
+            self.enable_prefix_caching = False
+        if (
+            not current_platform.is_cuda()
+            and not current_platform.is_xpu()
+            and not current_platform.is_intel_hpu()
+            and not current_platform.is_maca()
+        ):
+            self.enable_prefix_caching = False
         if self.enable_logprob:
-            if self.speculative_config is not None:
-                raise NotImplementedError("Logprob does not support speculation_config.")
-            if self.enable_expert_parallel:
-                raise NotImplementedError("Logprob does not support enable_expert_parallel.")
-            if not current_platform.is_cuda():
-                raise NotImplementedError("Only CUDA platform supports logprob.")
+            if not current_platform.is_cuda() and not current_platform.is_xpu():
+                raise NotImplementedError("Only CUDA and XPU platforms support logprob.")
+            if self.speculative_config is not None and self.logprobs_mode.startswith("processed"):
+                raise NotImplementedError("processed_logprobs not support in speculative.")
+            if self.speculative_config is not None and self.max_logprobs == -1:
+                raise NotImplementedError("max_logprobs=-1 not support in speculative.")
+            if not envs.FD_USE_GET_SAVE_OUTPUT_V1 and (self.max_logprobs == -1 or self.max_logprobs > 20):
+                self.max_logprobs = 20
+                console_logger.warning("Set max_logprobs=20 when FD_USE_GET_SAVE_OUTPUT_V1=0")
+            if self.max_logprobs == -1 and not envs.ENABLE_V1_KVCACHE_SCHEDULER:
+                raise NotImplementedError("Only ENABLE_V1_KVCACHE_SCHEDULER=1 support max_logprobs=-1")
+
+        if self.splitwise_role != "mixed":
+            if self.scheduler_name == "local" and self.router is None:
+                raise ValueError(
+                    f"When using {self.splitwise_role} role and the {self.scheduler_name} "
+                    f"scheduler, please provide --router argument."
+                )
+
+        if not (
+            current_platform.is_cuda()
+            or current_platform.is_xpu()
+            or current_platform.is_maca()
+            or current_platform.is_iluvatar()
+            or current_platform.is_intel_hpu()
+        ):
+            envs.ENABLE_V1_KVCACHE_SCHEDULER = 0
+
+        if "PaddleOCR" in get_model_architecture(self.model, self.model_config_name):
+            envs.FD_ENABLE_MAX_PREFILL = 1
+            # TODO XPU support PaddleOCR prefix caching
+            if current_platform.is_xpu():
+                self.enable_prefix_caching = False
+
+        if self.kvcache_storage_backend is not None:
+            if not self.enable_prefix_caching:
+                raise NotImplementedError("kvcache_storage_backend is only supported when enable_prefix_caching=True")
+            if envs.ENABLE_V1_KVCACHE_SCHEDULER == 0:
+                raise NotImplementedError(
+                    "kvcache_storage_backend is only supported when ENABLE_V1_KVCACHE_SCHEDULER=1"
+                )
+
+        self.post_init_all_ports()
+
+    def post_init_all_ports(self):
+
+        def post_init_ports(name: str, ports: list, num_total_ports: int):
+            ports = parse_ports(ports)
+            num_cur_dp_ports = num_total_ports
+            if envs.FD_ENABLE_MULTI_API_SERVER:
+                num_cur_dp_ports //= self.data_parallel_size
+            if ports is None:
+                ports = find_free_ports(num_ports=num_cur_dp_ports)
+                console_logger.info(
+                    f"Parameter `{name}` is not specified, found available ports for possible use: {ports}"
+                )
+            else:
+                num_input_ports = len(ports)
+                if num_input_ports != num_total_ports:
+                    ports = find_free_ports(num_ports=num_cur_dp_ports)
+                    console_logger.warn(
+                        f"Parameter `{name}` expects {num_total_ports} ports, but got {num_input_ports}. Ignore them and assign new ones: {ports}"
+                    )
+                else:
+                    console_logger.info(f"Using `{name}`: {ports}")
+
+            if not self.skip_port_check:
+                cur_dp_ports = ports[
+                    num_cur_dp_ports
+                    * self.local_data_parallel_id : num_cur_dp_ports
+                    * (self.local_data_parallel_id + 1)
+                ]
+                for port in cur_dp_ports:
+                    assert is_port_available("0.0.0.0", port), f"Parameter `{name}`:{port} is already in use."
+
+            console_logger.debug(f"post init {name}: {ports}")
+            return ports
+
+        num_nodes = len(self.ips) if self.ips else 1
+        if self.data_parallel_size % num_nodes != 0:
+            raise ValueError(
+                f"data_parallel_size ({self.data_parallel_size}) must be divisible by num_nodes ({num_nodes})."
+            )
+        self.engine_worker_queue_port = post_init_ports(
+            "engine_worker_queue_port",
+            self.engine_worker_queue_port,
+            self.data_parallel_size // num_nodes,
+        )
+        self.cache_queue_port = post_init_ports(
+            "cache_queue_port",
+            self.cache_queue_port,
+            self.data_parallel_size // num_nodes,
+        )
+        self.rdma_comm_ports = post_init_ports(
+            "rdma_comm_ports",
+            self.rdma_comm_ports,
+            self.tensor_parallel_size * self.data_parallel_size // num_nodes,
+        )
+        self.pd_comm_port = post_init_ports(
+            "pd_comm_port",
+            self.pd_comm_port,
+            self.data_parallel_size // num_nodes,
+        )
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -378,6 +655,12 @@ class EngineArgs:
             type=str,
             default=EngineArgs.model,
             help="Model name or path to be used.",
+        )
+        model_group.add_argument(
+            "--served-model-name",
+            type=nullable_str,
+            default=EngineArgs.served_model_name,
+            help="Served model name",
         )
         model_group.add_argument(
             "--revision",
@@ -398,6 +681,12 @@ class EngineArgs:
             help="Tokenizer name or path (defaults to model path if not specified).",
         )
         model_group.add_argument(
+            "--tokenizer-base-url",
+            type=nullable_str,
+            default=EngineArgs.tokenizer_base_url,
+            help="The base URL of the remote tokenizer service (used instead of local tokenizer if provided).",
+        )
+        model_group.add_argument(
             "--max-model-len",
             type=int,
             default=EngineArgs.max_model_len,
@@ -416,6 +705,21 @@ class EngineArgs:
             help="Task to be executed by the model.",
         )
         model_group.add_argument(
+            "--runner",
+            type=str,
+            default=EngineArgs.runner,
+            help="The type of model runner to use",
+        )
+        model_group.add_argument(
+            "--convert", type=str, default=EngineArgs.convert, help="Convert the model using adapters"
+        )
+        model_group.add_argument(
+            "--override-pooler-config",
+            type=json.loads,
+            default=EngineArgs.override_pooler_config,
+            help="Override the pooler configuration with a JSON string.",
+        )
+        model_group.add_argument(
             "--use-warmup",
             type=int,
             default=EngineArgs.use_warmup,
@@ -432,6 +736,18 @@ class EngineArgs:
             default=EngineArgs.mm_processor_kwargs,
             type=json.loads,
             help="Additional keyword arguments for the multi-modal processor.",
+        )
+        model_group.add_argument(
+            "--max-encoder-cache",
+            default=EngineArgs.max_encoder_cache,
+            type=int,
+            help="Maximum encoder cache tokens(use 0 to disable).",
+        )
+        model_group.add_argument(
+            "--max-processor-cache",
+            default=EngineArgs.max_processor_cache,
+            type=float,
+            help="Maximum processor cache bytes(use 0 to disable).",
         )
         model_group.add_argument(
             "--enable-mm",
@@ -484,30 +800,30 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--engine-worker-queue-port",
-            type=int,
+            type=lambda s: s.split(",") if s else None,
             default=EngineArgs.engine_worker_queue_port,
             help="port for engine worker queue",
         )
         model_group.add_argument(
             "--quantization",
-            type=str,
+            type=parse_quantization,
             default=EngineArgs.quantization,
-            help="Quantization name for the model, currentlly support "
+            help="Quantization name for the model, currently support "
             "'wint8', 'wint4',"
             "default is None. The priority of this configuration "
             "is lower than that of the config file. "
             "More complex quantization methods need to be configured via the config file.",
         )
         model_group.add_argument(
-            "--use-cudagraph",
-            action="store_true",
-            default=EngineArgs.use_cudagraph,
-            help="Flags to enable cuda graph.",
-        )
-        model_group.add_argument(
             "--graph-optimization-config",
             type=json.loads,
             default=EngineArgs.graph_optimization_config,
+            help="Configuration for graph optimization",
+        )
+        model_group.add_argument(
+            "--plas-attention-config",
+            type=json.loads,
+            default=EngineArgs.plas_attention_config,
             help="",
         )
         model_group.add_argument(
@@ -529,6 +845,19 @@ class EngineArgs:
             help="Enable output of token-level log probabilities.",
         )
         model_group.add_argument(
+            "--max-logprobs",
+            type=int,
+            default=EngineArgs.max_logprobs,
+            help="Maximum number of log probabilities.",
+        )
+        model_group.add_argument(
+            "--logprobs-mode",
+            type=str,
+            choices=["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"],
+            default=EngineArgs.logprobs_mode,
+            help="Indicates the content returned in the logprobs.",
+        )
+        model_group.add_argument(
             "--seed",
             type=int,
             default=EngineArgs.seed,
@@ -546,6 +875,25 @@ class EngineArgs:
             default=EngineArgs.early_stop_config,
             help="the config for early stop.",
         )
+        model_group.add_argument(
+            "--lm_head-fp32",
+            action="store_true",
+            default=EngineArgs.lm_head_fp32,
+            help="Specify the dtype of lm_head weight as float32.",
+        )
+        model_group.add_argument(
+            "--logits-processors",
+            type=str,
+            nargs="+",
+            default=EngineArgs.logits_processors,
+            help="FQCNs (Fully Qualified Class Names) of logits processors supported by the service.",
+        )
+        model_group.add_argument(
+            "--enable-entropy",
+            action="store_true",
+            default=EngineArgs.enable_entropy,
+            help="Enable output of token-level entropy.",
+        )
 
         # Parallel processing parameters group
         parallel_group = parser.add_argument_group("Parallel Configuration")
@@ -557,10 +905,22 @@ class EngineArgs:
             help="Degree of tensor parallelism.",
         )
         parallel_group.add_argument(
-            "--enable-custom-all-reduce",
+            "--disable-custom-all-reduce",
             action="store_true",
-            default=EngineArgs.enable_custom_all_reduce,
-            help="Flag to enable custom all-reduce.",
+            default=EngineArgs.disable_custom_all_reduce,
+            help="Flag to disable custom all-reduce.",
+        )
+        parallel_group.add_argument(
+            "--use-internode-ll-two-stage",
+            action="store_true",
+            default=EngineArgs.use_internode_ll_two_stage,
+            help="Flag to use the internode_ll_two_stage kernel.",
+        )
+        parallel_group.add_argument(
+            "--disable-sequence-parallel-moe",
+            action="store_true",
+            default=EngineArgs.disable_sequence_parallel_moe,
+            help="Flag to disable disable the sequence parallel moe.",
         )
         parallel_group.add_argument(
             "--max-num-seqs",
@@ -593,21 +953,64 @@ class EngineArgs:
             default=EngineArgs.data_parallel_size,
             help="Degree of data parallelism.",
         )
+
+        parallel_group.add_argument(
+            "--local-data-parallel-id",
+            type=int,
+            default=EngineArgs.local_data_parallel_id,
+            help="the rank of data parallelism.",
+        )
         parallel_group.add_argument(
             "--enable-expert-parallel",
             action="store_true",
             default=EngineArgs.enable_expert_parallel,
             help="Enable expert parallelism.",
         )
+        parallel_group.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            default=EngineArgs.enable_eplb,
+            help="Enable eplb.",
+        )
+        parallel_group.add_argument(
+            "--eplb-config",
+            type=json.loads,
+            default=EngineArgs.eplb_config,
+            help="Config of eplb.",
+        )
+        parallel_group.add_argument(
+            "--routing-replay-config",
+            type=json.loads,
+            default=EngineArgs.routing_replay_config,
+            help="Flag of rollout routing replay(r3).",
+        )
+        parallel_group.add_argument(
+            "--enable-chunked-moe",
+            action="store_true",
+            default=EngineArgs.enable_chunked_moe,
+            help="Use chunked moe.",
+        )
+        parallel_group.add_argument(
+            "--chunked-moe-size",
+            type=int,
+            default=EngineArgs.chunked_moe_size,
+            help="Chunked size of moe input.",
+        )
+        parallel_group.add_argument(
+            "--shutdown-comm-group-if-worker-idle",
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.shutdown_comm_group_if_worker_idle,
+            help="Shutdown communication group when worker is idle.",
+        )
 
         # Load group
         load_group = parser.add_argument_group("Load Configuration")
         load_group.add_argument(
-            "--load_choices",
+            "--load-choices",
             type=str,
             default=EngineArgs.load_choices,
             help="The format of the model weights to load.\
-                 default/new_loader.",
+                 default/default_v1.",
         )
 
         # CacheConfig parameters group
@@ -627,13 +1030,13 @@ class EngineArgs:
         cache_group.add_argument(
             "--prealloc-dec-block-slot-num-threshold",
             type=int,
-            default=5,
+            default=EngineArgs.prealloc_dec_block_slot_num_threshold,
             help="Number of token slot threadshold to allocate next blocks for decoding.",
         )
 
         cache_group.add_argument(
             "--cache-queue-port",
-            type=int,
+            type=lambda s: [int(item.strip()) for item in s.split(",")] if s else None,
             default=EngineArgs.cache_queue_port,
             help="port for cache queue",
         )
@@ -642,6 +1045,22 @@ class EngineArgs:
             type=int,
             default=EngineArgs.static_decode_blocks,
             help="Static decoding blocks num.",
+        )
+
+        cache_group.add_argument(
+            "--kvcache-storage-backend",
+            type=nullable_str,
+            choices=["mooncake"],
+            default=EngineArgs.kvcache_storage_backend,
+            help="The storage backend for kvcache storage. Leave empty to disable.",
+        )
+
+        cache_group.add_argument(
+            "--write-policy",
+            type=str,
+            choices=["write_through"],
+            default=EngineArgs.write_policy,
+            help="KVCache write policy",
         )
 
         # Cluster system parameters group
@@ -657,24 +1076,16 @@ class EngineArgs:
         perf_group = parser.add_argument_group("Performance Tuning")
         perf_group.add_argument(
             "--enable-prefix-caching",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             default=EngineArgs.enable_prefix_caching,
             help="Flag to enable prefix caching.",
         )
 
         perf_group.add_argument(
-            "--splitwise-role",
-            type=str,
-            default=EngineArgs.splitwise_role,
-            help="Role of splitwise. Default is \
-            'mixed'. (prefill, decode, mixed)",
-        )
-
-        perf_group.add_argument(
-            "--innode-prefill-ports",
-            type=lambda s: s.split(",") if s else None,
-            default=EngineArgs.innode_prefill_ports,
-            help="port for innode prefill",
+            "--enable-output-caching",
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.enable_output_caching,
+            help="Flag to enable output caching.",
         )
 
         perf_group.add_argument(
@@ -706,25 +1117,51 @@ class EngineArgs:
             help=("For chunked prefill, the threshold number of" " tokens for a prompt to be considered long."),
         )
 
-        perf_group.add_argument(
+        # Splitwise deployment parameters group
+        splitwise_group = parser.add_argument_group("Splitwise Deployment")
+        splitwise_group.add_argument(
+            "--splitwise-role",
+            type=str,
+            default=EngineArgs.splitwise_role,
+            help="Role of splitwise. Default is \
+            'mixed'. (prefill, decode, mixed)",
+        )
+
+        splitwise_group.add_argument(
             "--cache-transfer-protocol",
             type=str,
             default=EngineArgs.cache_transfer_protocol,
-            help="support protocol list, comma separated, default is ipc",
+            help="support protocol list (ipc or rdma), comma separated, default is ipc",
         )
 
-        perf_group.add_argument(
+        splitwise_group.add_argument(
             "--pd-comm-port",
             type=lambda s: s.split(",") if s else None,
             default=EngineArgs.pd_comm_port,
             help="port for splitwise communication.",
         )
 
-        perf_group.add_argument(
+        splitwise_group.add_argument(
             "--rdma-comm-ports",
             type=lambda s: s.split(",") if s else None,
             default=EngineArgs.rdma_comm_ports,
             help="ports for rdma communication.",
+        )
+
+        perf_group.add_argument(
+            "--disable-chunked-mm-input",
+            action="store_true",
+            default=EngineArgs.disable_chunked_mm_input,
+            help="Disable chunked mm input.",
+        )
+
+        # Router parameters group
+        router_group = parser.add_argument_group("Router")
+        router_group.add_argument(
+            "--router",
+            type=str,
+            default=EngineArgs.router,
+            help="url for router server.",
         )
 
         # Scheduler parameters group
@@ -771,7 +1208,7 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--scheduler-topic",
             default=EngineArgs.scheduler_topic,
-            help=f"Topic of scheduler. Defaule is {EngineArgs.scheduler_topic}. (global)",
+            help=f"Topic of scheduler. Default is {EngineArgs.scheduler_topic}. (global)",
         )
         scheduler_group.add_argument(
             "--scheduler-min-load-score",
@@ -843,11 +1280,15 @@ class EngineArgs:
         return parser
 
     @classmethod
-    def from_cli_args(cls, args: FlexibleArgumentParser) -> "EngineArgs":
+    def from_cli_args(cls, args: FlexibleArgumentParser, skip_port_check=False) -> "EngineArgs":
         """
         Create an instance of EngineArgs from command line arguments.
         """
-        return cls(**{field.name: getattr(args, field.name) for field in dataclass_fields(cls)})
+        args_dict = {}
+        for field in dataclass_fields(cls):
+            if hasattr(args, field.name):
+                args_dict[field.name] = getattr(args, field.name)
+        return cls(**args_dict, skip_port_check=skip_port_check)
 
     def create_speculative_config(self) -> SpeculativeConfig:
         """ """
@@ -860,27 +1301,20 @@ class EngineArgs:
 
     def create_scheduler_config(self) -> SchedulerConfig:
         """
-        Create and retuan a SchedulerConfig object based on the current settings.
+        Create and return a SchedulerConfig object based on the current settings.
         """
         prefix = "scheduler_"
         prefix_len = len(prefix)
-        extra_params = [
-            "max_model_len",
-            "enable_chunked_prefill",
-            "max_num_partial_prefills",
-            "max_long_partial_prefills",
-            "long_prefill_token_threshold",
-        ]
 
         all = asdict(self)
+        all.pop("port")  # port and scheduler_port are not the same
         params = dict()
         for k, v in all.items():
             if k[:prefix_len] == prefix:
                 params[k[prefix_len:]] = v
-            elif k in extra_params:
+            else:
                 params[k] = v
-
-        return SchedulerConfig(**params)
+        return SchedulerConfig(params)
 
     def create_graph_optimization_config(self) -> GraphOptimizationConfig:
         """
@@ -892,6 +1326,18 @@ class EngineArgs:
                 graph_optimization_args[k] = v
         return GraphOptimizationConfig(graph_optimization_args)
 
+    def create_plas_attention_config(self) -> PlasAttentionConfig:
+        """
+        Create and retuan a PlasAttentionConfig object based on the current settings.
+        """
+        attention_args = asdict(self)
+        if self.plas_attention_config is not None:
+            for k, v in self.plas_attention_config.items():
+                attention_args[k] = v
+            return PlasAttentionConfig(attention_args)
+        else:
+            return PlasAttentionConfig(None)
+
     def create_early_stop_config(self) -> EarlyStopConfig:
         """
         Create and retuan an EarlyStopConfig object based on the current settings.
@@ -902,7 +1348,26 @@ class EngineArgs:
                 early_stop_args[k] = v
         return EarlyStopConfig(early_stop_args)
 
-    def create_engine_config(self) -> Config:
+    def create_eplb_config(self) -> EPLBConfig:
+        """
+        Create and retuan an EPLBConfig object based on the current settings.
+        """
+        eplb_args = asdict(self)
+        if self.eplb_config is not None:
+            for k, v in self.eplb_config.items():
+                eplb_args[k] = v
+        eplb_args["enable_eplb"] = self.enable_eplb
+        return EPLBConfig(eplb_args)
+
+    def create_routing_repaly_config(self) -> RoutingReplayConfig:
+        """ """
+        routing_replay_args = asdict(self)
+        if self.routing_replay_config is not None:
+            for k, v in self.routing_replay_config.items():
+                routing_replay_args[k] = v
+        return RoutingReplayConfig(routing_replay_args)
+
+    def create_engine_config(self) -> FDConfig:
         """
         Create and return a Config object based on the current settings.
         """
@@ -911,14 +1376,28 @@ class EngineArgs:
 
         if not model_cfg.is_unified_ckpt and hasattr(model_cfg, "tensor_parallel_size"):
             self.tensor_parallel_size = model_cfg.tensor_parallel_size
+
+        speculative_cfg = self.create_speculative_config()
+        if not self.enable_chunked_prefill:
+            if (current_platform.is_cuda() or current_platform.is_maca()) and self.splitwise_role == "mixed":
+                # default enable chunked prefill
+                self.enable_chunked_prefill = True
+
+            self.disable_chunked_prefill = int(envs.FD_DISABLE_CHUNKED_PREFILL)
+            if self.disable_chunked_prefill:
+                self.enable_chunked_prefill = False
+
         if self.max_num_batched_tokens is None:
-            if self.enable_chunked_prefill:
-                self.max_num_batched_tokens = 2048
-            else:
-                if not int(os.getenv("ENABLE_V1_KVCACHE_SCHEDULER", "0")):
+            if int(envs.ENABLE_V1_KVCACHE_SCHEDULER):
+                if current_platform.is_maca():
                     self.max_num_batched_tokens = self.max_model_len
                 else:
                     self.max_num_batched_tokens = 8192  # if set to max_model_len, it's easy to be OOM
+            else:
+                if self.enable_chunked_prefill:
+                    self.max_num_batched_tokens = 2048
+                else:
+                    self.max_num_batched_tokens = self.max_model_len
 
         all_dict = asdict(self)
         all_dict["model_cfg"] = model_cfg
@@ -926,47 +1405,37 @@ class EngineArgs:
         load_cfg = LoadConfig(all_dict)
         parallel_cfg = ParallelConfig(all_dict)
         scheduler_cfg = self.create_scheduler_config()
-        speculative_cfg = self.create_speculative_config()
         graph_opt_cfg = self.create_graph_optimization_config()
-        graph_opt_cfg.update_use_cudagraph(self.use_cudagraph)
+        plas_attention_config = self.create_plas_attention_config()
+        eplb_cfg = self.create_eplb_config()
+        routing_replay_config = self.create_routing_repaly_config()
+        router_config = RouterConfig(all_dict)
 
         early_stop_cfg = self.create_early_stop_config()
         early_stop_cfg.update_enable_early_stop(self.enable_early_stop)
+        structured_outputs_config: StructuredOutputsConfig = StructuredOutputsConfig(args=all_dict)
 
-        assert not (
-            self.tensor_parallel_size <= 1 and self.enable_custom_all_reduce
-        ), "enable_custom_all_reduce must be used with tensor_parallel_size>1"
-
-        return Config(
-            model_name_or_path=self.model,
+        return FDConfig(
             model_config=model_cfg,
             scheduler_config=scheduler_cfg,
             tokenizer=self.tokenizer,
             cache_config=cache_cfg,
             load_config=load_cfg,
             parallel_config=parallel_cfg,
-            max_model_len=self.max_model_len,
-            tensor_parallel_size=self.tensor_parallel_size,
-            max_num_seqs=self.max_num_seqs,
             speculative_config=speculative_cfg,
-            max_num_batched_tokens=self.max_num_batched_tokens,
+            eplb_config=eplb_cfg,
+            structured_outputs_config=structured_outputs_config,
+            router_config=router_config,
             ips=self.ips,
             use_warmup=self.use_warmup,
-            engine_worker_queue_port=self.engine_worker_queue_port,
             limit_mm_per_prompt=self.limit_mm_per_prompt,
             mm_processor_kwargs=self.mm_processor_kwargs,
-            # enable_mm=self.enable_mm,
-            reasoning_parser=self.reasoning_parser,
             tool_parser=self.tool_call_parser,
-            splitwise_role=self.splitwise_role,
-            innode_prefill_ports=self.innode_prefill_ports,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
-            graph_optimization_config=graph_opt_cfg,
-            guided_decoding_backend=self.guided_decoding_backend,
-            disable_any_whitespace=self.guided_decoding_disable_any_whitespace,
-            enable_logprob=self.enable_logprob,
+            graph_opt_config=graph_opt_cfg,
+            plas_attention_config=plas_attention_config,
             early_stop_config=early_stop_cfg,
-            load_choices=self.load_choices,
+            routing_replay_config=routing_replay_config,
         )

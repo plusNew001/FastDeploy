@@ -81,7 +81,7 @@ class BlockAttentionBackend(AttentionBackend):
         super().__init__()
         self.attention_metadata: BlockAttentionMetadata = None
         self.block_size = fd_config.cache_config.block_size
-        self.max_seq_len = fd_config.parallel_config.max_model_len
+        self.max_seq_len = fd_config.model_config.max_model_len
         self.rope_theta = 10000.0 if fd_config.model_config.rope_theta is None else fd_config.model_config.rope_theta
         self.rank = fd_config.parallel_config.tensor_parallel_rank
 
@@ -114,22 +114,24 @@ class BlockAttentionBackend(AttentionBackend):
         kv_cache_quant_type: str = None,
     ):
         """
-        Caculate kv cache shape
+        Calculate kv cache shape
         """
+        key_cache_shape = [max_num_blocks, self.kv_num_heads, self.block_size, self.head_dim]
+        value_cache_shape = [max_num_blocks, self.kv_num_heads, self.block_size, self.head_dim]
         if kv_cache_quant_type is not None and kv_cache_quant_type == "int4_zp":
-            return (
+            key_cache_shape = [
                 max_num_blocks,
                 self.kv_num_heads,
                 self.block_size,
                 self.head_dim // 2,
-            )
-        else:
-            return (
+            ]
+            value_cache_shape = [
                 max_num_blocks,
                 self.kv_num_heads,
                 self.block_size,
-                self.head_dim,
-            )
+                self.head_dim // 2,
+            ]
+        return key_cache_shape, value_cache_shape
 
     def forward_mixed(
         self,
@@ -154,7 +156,7 @@ class BlockAttentionBackend(AttentionBackend):
             forward_meta.seq_lens_encoder,
             forward_meta.seq_lens_decoder,
             forward_meta.seq_lens_this_time,
-            forward_meta.padding_offset,
+            forward_meta.batch_id_per_token,
             forward_meta.cum_offsets,
             forward_meta.cu_seqlens_q,
             forward_meta.cu_seqlens_k,

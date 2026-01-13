@@ -301,6 +301,11 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
 
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...) \
   switch (head_dim) {                              \
+      case 64: {                                  \
+      constexpr size_t HEAD_DIM = 64;             \
+      __VA_ARGS__                                  \
+      break;                                       \
+    }                                              \
     case 128: {                                    \
       constexpr size_t HEAD_DIM = 128;             \
       __VA_ARGS__                                  \
@@ -439,6 +444,15 @@ __forceinline__ __host__ __device__ void vec_cast<nv_bfloat16, float>(
     __VA_ARGS__                                              \
   } else {                                                   \
     PD_THROW("not support the group_size", group_size);      \
+  }
+
+#define DISPATCH_DyCfp8(is_dynamic_cfp8, IsDynamicC8, ...) \
+  if (is_dynamic_cfp8) {                                   \
+    constexpr bool IsDynamicC8 = true;                     \
+    __VA_ARGS__                                            \
+  } else {                                                 \
+    constexpr bool IsDynamicC8 = false;                    \
+    __VA_ARGS__                                            \
   }
 
 #define DISPATCH_MLA_GROUP_SIZE(group_size, GROUP_SIZE, ...) \

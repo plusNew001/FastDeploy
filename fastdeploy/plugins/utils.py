@@ -19,8 +19,6 @@ from typing import Any, Callable
 from fastdeploy import envs
 from fastdeploy.utils import llm_logger as logger
 
-plugins_loaded = False
-
 
 def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
     import sys
@@ -34,7 +32,7 @@ def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
 
     discovered_plugins = entry_points(group=group)
     if len(discovered_plugins) == 0:
-        logger.info("No plugins for group %s found.", group)
+        logger.debug("No plugins for group %s found.", group)
         return {}
 
     logger.info("Available plugins for group %s:", group)
@@ -43,19 +41,18 @@ def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
 
     if allowed_plugins is None:
         logger.info(
-            "All plugins in this group will be loaded. " "You can set `FD_PLUGINS` to control which plugins to load."
+            "All plugins in this group is not allowed. " "You can set `FD_PLUGINS` to control which plugins to load."
         )
+        return {}
 
     plugins = dict[str, Callable[[], Any]]()
     for plugin in discovered_plugins:
-        if allowed_plugins is None or plugin.name in allowed_plugins:
-            if allowed_plugins is not None:
-                logger.info("Loading plugin %s", plugin.name)
-
+        if plugin.name in allowed_plugins:
+            logger.info("Loading plugin %s", plugin.name)
             try:
                 func = plugin.load()
                 plugins[plugin.name] = func
-            except Exception:
-                logger.exception("Failed to load plugin %s", plugin.name)
+            except Exception as e:
+                logger.exception(f"Failed to load plugin {plugin.name}, error: {e}")
 
     return plugins

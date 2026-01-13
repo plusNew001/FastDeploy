@@ -16,7 +16,7 @@ set +x
 
 # use pre-commit 4.2.0
 if ! [[ $(pre-commit --version) == *"4.2.0"* ]]; then
-    pip install pre-commit==4.2.0 1>nul
+    pip install pre-commit==4.2.0 1>/dev/null
 fi
 
 # Install clang-format before git commit to avoid repeat installation due to
@@ -28,9 +28,14 @@ if ! [[ $(python -V 2>&1 | awk '{print $2}' | awk -F '.' '{print $1$2}') -ge 36 
           please change the default python to higher version."
     exit 1
 fi
+if ! [[ $version == *"$VERSION"* ]]; then
+    # low version of pip may not have the source of clang-format whl
+    pip install --upgrade pip
+    pip install clang-format==13.0.0
+fi
 
 # Exclude any files under the 'test/ce/server/' directory from code style checks.
-diff_files=$(git diff --name-only --diff-filter=ACMR ${BRANCH} | grep -v '^test/ce/server/')
+diff_files=$(git diff --name-only --diff-filter=ACMR ${BRANCH} | grep -v '^tests/ce/server/')
 num_diff_files=$(echo "$diff_files" | wc -l)
 echo -e "diff files between pr and ${BRANCH}:\n${diff_files}"
 
@@ -50,7 +55,7 @@ if [ ${check_error} != 0 ];then
     echo "Your PR code style check failed."
     echo "Please install pre-commit locally and set up git hook scripts:"
     echo ""
-    echo "    pip install pre-commit==4.2.0"
+    echo "    pip install pre-commit==4.2.0 clang-format==13.0.0"
     echo "    pre-commit install"
     echo ""
     if [[ $num_diff_files -le 100 ]];then

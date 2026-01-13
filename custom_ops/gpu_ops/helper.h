@@ -14,10 +14,13 @@
 
 #pragma once
 
+#include <cuda_fp8.h>
+
 #ifndef PADDLE_WITH_COREX
 #include "glog/logging.h"
 #endif
 #include <fcntl.h>
+#include <nvml.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,14 +28,17 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <cassert>
+#include <cstdlib>
+#include <cstring>
 
 #ifdef PADDLE_WITH_HIP
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
 #include <hiprand.h>
 #include <hiprand_kernel.h>
+#include <hipcub/hipcub.hpp>
 namespace cub = hipcub;
 #else
 #include <cub/cub.cuh>
@@ -51,8 +57,8 @@ namespace cub = hipcub;
 #else
 #include "paddle/phi/core/cuda_stream.h"
 #endif
-#include "paddle/phi/core/dense_tensor.h"
 #include "paddle/phi/backends/gpu/gpu_info.h"
+#include "paddle/phi/core/dense_tensor.h"
 
 #ifdef PADDLE_WITH_COREX
 #define WARP_SIZE 64
@@ -67,14 +73,16 @@ namespace cub = hipcub;
 using json = nlohmann::json;
 #endif
 
-#define CUDA_CHECK(call)                                                       \
-  do {                                                                         \
-    const cudaError_t error_code = call;                                       \
-    if (error_code != cudaSuccess) {                                           \
-      std::printf("at %s:%d - %s.\n", __FILE__, __LINE__,                      \
-                  cudaGetErrorString(error_code));                             \
-      exit(1);                                                                 \
-    }                                                                          \
+#define CUDA_CHECK(call)                           \
+  do {                                             \
+    const cudaError_t error_code = call;           \
+    if (error_code != cudaSuccess) {               \
+      std::printf("at %s:%d - %s.\n",              \
+                  __FILE__,                        \
+                  __LINE__,                        \
+                  cudaGetErrorString(error_code)); \
+      exit(1);                                     \
+    }                                              \
   } while (0)
 
 #ifdef PADDLE_WITH_HIP
@@ -103,9 +111,10 @@ inline hipError_t GetNumBlocks(int64_t n, int *num_blocks) {
       return err;
     }
   }
-  *num_blocks = std::max<int>(
-      1, std::min<int64_t>((n + kBlockSize - 1) / kBlockSize,
-                           sm_count * tpm / kBlockSize * kNumWaves));
+  *num_blocks =
+      std::max<int>(1,
+                    std::min<int64_t>((n + kBlockSize - 1) / kBlockSize,
+                                      sm_count * tpm / kBlockSize * kNumWaves));
   return hipSuccess;
 }
 #else
@@ -134,9 +143,10 @@ inline cudaError_t GetNumBlocks(int64_t n, int *num_blocks) {
       return err;
     }
   }
-  *num_blocks = std::max<int>(
-      1, std::min<int64_t>((n + kBlockSize - 1) / kBlockSize,
-                           sm_count * tpm / kBlockSize * kNumWaves));
+  *num_blocks =
+      std::max<int>(1,
+                    std::min<int64_t>((n + kBlockSize - 1) / kBlockSize,
+                                      sm_count * tpm / kBlockSize * kNumWaves));
   return cudaSuccess;
 }
 
@@ -151,28 +161,59 @@ inline int GetGPUComputeCapability(int id) {
 
 #endif
 
+#ifndef FP8_E4M3_MAX
+#define FP8_E4M3_MAX 448.0
+#endif
+
+#ifndef DISPATCH_FLOAT_FP6_DTYPE
+#define DISPATCH_FLOAT_FP6_DTYPE(pd_dtype, c_type, ...)                     \
+  switch (pd_dtype) {                                                       \
+    case phi::DataType::FLOAT32: {                                          \
+      using c_type = float;                                                 \
+      __VA_ARGS__                                                           \
+      break;                                                                \
+    }                                                                       \
+    case phi::DataType::BFLOAT16: {                                         \
+      using c_type = phi::dtype::bfloat16;                                  \
+      __VA_ARGS__                                                           \
+      break;                                                                \
+    }                                                                       \
+    case phi::DataType::FLOAT16: {                                          \
+      using c_type = phi::dtype::float16;                                   \
+      __VA_ARGS__                                                           \
+      break;                                                                \
+    }                                                                       \
+    default: {                                                              \
+      PD_THROW("Only supported attr of input type in [fp32, fp16, bf16]."); \
+    }                                                                       \
+  }
+#endif
+
 inline constexpr uint32_t next_pow_2(uint32_t const num) {
-  if (num <= 1)
-    return num;
+  if (num <= 1) return num;
   return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
 }
 
-template <paddle::DataType D> class PDTraits;
+template <paddle::DataType D>
+class PDTraits;
 
-template <> class PDTraits<paddle::DataType::FLOAT32> {
-public:
+template <>
+class PDTraits<paddle::DataType::FLOAT32> {
+ public:
   typedef float DataType;
   typedef float data_t;
 };
 
-template <> class PDTraits<paddle::DataType::FLOAT16> {
-public:
+template <>
+class PDTraits<paddle::DataType::FLOAT16> {
+ public:
   typedef half DataType;
   typedef paddle::float16 data_t;
 };
 
-template <> class PDTraits<paddle::DataType::BFLOAT16> {
-public:
+template <>
+class PDTraits<paddle::DataType::BFLOAT16> {
+ public:
 #ifdef PADDLE_WITH_HIP
   typedef hip_bfloat16 DataType;
 #else
@@ -181,19 +222,31 @@ public:
   typedef paddle::bfloat16 data_t;
 };
 
-template <> class PDTraits<paddle::DataType::INT8> {
-public:
+template <>
+class PDTraits<paddle::DataType::INT8> {
+ public:
   typedef int8_t DataType;
   typedef int8_t data_t;
 };
 
-template <> class PDTraits<paddle::DataType::UINT8> {
-public:
+template <>
+class PDTraits<paddle::DataType::UINT8> {
+ public:
   typedef uint8_t DataType;
   typedef uint8_t data_t;
 };
 
-template <typename T, int Size> struct alignas(sizeof(T) * Size) AlignedVector {
+#ifndef PADDLE_WITH_COREX
+template <>
+class PDTraits<paddle::DataType::FLOAT8_E4M3FN> {
+ public:
+  typedef __nv_fp8_e4m3 DataType;
+  typedef paddle::float8_e4m3fn data_t;
+};
+#endif
+
+template <typename T, int Size>
+struct alignas(sizeof(T) * Size) AlignedVector {
   T val[Size];
 
   HOSTDEVICE inline const T &operator[](int i) const { return val[i]; }
@@ -218,7 +271,7 @@ HOSTDEVICE inline void Store(const AlignedVector<T, Size> &vec, T *addr) {
 template <int Size>
 HOSTDEVICE inline void Store(const AlignedVector<hip_bfloat16, Size> &vec,
                              int8_t *addr) {
-    printf("Error: Store hip_bfloat16 to int8_t is not supported!");
+  printf("Error: Store hip_bfloat16 to int8_t is not supported!");
 }
 #else
 template <int Size>
@@ -236,11 +289,13 @@ HOSTDEVICE inline void Store(const AlignedVector<half, Size> &vec,
 
 constexpr int VEC_16B = 16;
 
-template <typename T> __device__ T max_func(const T a, const T b) {
+template <typename T>
+__device__ T max_func(const T a, const T b) {
   return a > b ? a : b;
 }
 
-template <typename T> struct MaxOp {
+template <typename T>
+struct MaxOp {
   __device__ __forceinline__ T operator()(const T &a, const T &b) const {
     return max_func(a, b);
   }
@@ -273,14 +328,14 @@ inline json readJsonFromFile(const std::string &filePath) {
 }
 #endif
 
-#define cudaCheckError()                                                       \
-  {                                                                            \
-    cudaError_t e = cudaGetLastError();                                        \
-    if (e != cudaSuccess) {                                                    \
-      std::cerr << "CUDA Error " << __FILE__ << ":" << __LINE__ << ": "        \
-                << cudaGetErrorString(e) << std::endl;                         \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
+#define cudaCheckError()                                                \
+  {                                                                     \
+    cudaError_t e = cudaGetLastError();                                 \
+    if (e != cudaSuccess) {                                             \
+      std::cerr << "CUDA Error " << __FILE__ << ":" << __LINE__ << ": " \
+                << cudaGetErrorString(e) << std::endl;                  \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
   }
 
 // place must be an existing place object and cannot use paddle::CPUPlace() or
@@ -293,8 +348,8 @@ inline paddle::Tensor GetEmptyTensor(const common::DDim &dims,
   auto *allocator = paddle::GetAllocator(place);
   phi::DenseTensor dense_tensor;
   dense_tensor.Resize(dims);
-  dense_tensor.AllocateFrom(allocator, dtype,
-                            dense_tensor.numel() * phi::SizeOf(dtype));
+  dense_tensor.AllocateFrom(
+      allocator, dtype, dense_tensor.numel() * phi::SizeOf(dtype));
   return paddle::Tensor(std::make_shared<phi::DenseTensor>(dense_tensor));
 }
 
@@ -305,39 +360,63 @@ inline paddle::Tensor GetEmptyTensor(const common::DDim &dims,
   auto *allocator = paddle::GetAllocator(place);
   phi::DenseTensor dense_tensor;
   dense_tensor.Resize(dims);
-  dense_tensor.AllocateFrom(allocator, dtype,
-                            dense_tensor.numel() * phi::SizeOf(dtype));
+  dense_tensor.AllocateFrom(
+      allocator, dtype, dense_tensor.numel() * phi::SizeOf(dtype));
   dense_tensor.set_strides(strides);
   return paddle::Tensor(std::make_shared<phi::DenseTensor>(dense_tensor));
 }
 #endif
 
-__global__ void free_and_dispatch_block(
-    bool *stop_flags, int *seq_lens_this_time, int *seq_lens_decoder,
-    int *block_tables, int *encoder_block_lens, bool *is_block_step,
-    int *step_block_list, // [bsz]
-    int *step_len, int *recover_block_list, int *recover_len,
-    int *need_block_list, int *need_block_len, int *used_list_len,
-    int *free_list, int *free_list_len, int64_t *first_token_ids, const int bsz,
-    const int block_size, const int block_num_per_seq,
-    const int max_decoder_block_num);
+__global__ void free_and_dispatch_block(bool *stop_flags,
+                                        int *seq_lens_this_time,
+                                        int *seq_lens_decoder,
+                                        int *block_tables,
+                                        int *encoder_block_lens,
+                                        bool *is_block_step,
+                                        int *step_block_list,  // [bsz]
+                                        int *step_len,
+                                        int *recover_block_list,
+                                        int *recover_len,
+                                        int *need_block_list,
+                                        int *need_block_len,
+                                        int *used_list_len,
+                                        int *free_list,
+                                        int *free_list_len,
+                                        int64_t *first_token_ids,
+                                        const int bsz,
+                                        const int block_size,
+                                        const int block_num_per_seq,
+                                        const int max_decoder_block_num);
 
 __global__ void speculate_free_and_dispatch_block(
-    bool *stop_flags, int *seq_lens_this_time, int *seq_lens_decoder,
-    int *block_tables, int *encoder_block_lens, bool *is_block_step,
-    int *step_block_list, // [bsz]
-    int *step_len, int *recover_block_list, int *recover_len,
-    int *need_block_list, int *need_block_len, int *used_list_len,
-    int *free_list, int *free_list_len, int64_t *first_token_ids,
-    int *accept_num, const int bsz, const int block_size,
-    const int block_num_per_seq, const int max_decoder_block_num,
+    bool *stop_flags,
+    int *seq_lens_this_time,
+    int *seq_lens_decoder,
+    int *block_tables,
+    int *encoder_block_lens,
+    bool *is_block_step,
+    int *step_block_list,  // [bsz]
+    int *step_len,
+    int *recover_block_list,
+    int *recover_len,
+    int *need_block_list,
+    int *need_block_len,
+    int *used_list_len,
+    int *free_list,
+    int *free_list_len,
+    int64_t *first_token_ids,
+    int *accept_num,
+    const int bsz,
+    const int block_size,
+    const int block_num_per_seq,
+    const int max_decoder_block_num,
     const int max_draft_tokens);
 
 __device__ bool speculate_free_and_dispatch_block(const int &qid,
                                                   int *need_block_list,
                                                   const int &need_block_len);
 
-static std::string global_base64_chars = // NOLINT
+static std::string global_base64_chars =  // NOLINT
     "Tokp9lA/BjimRVKx32edMPFftOzsbNQ8C15Xn+YUEGc4WD0uLIq7hyJ6vZaHSwrg";
 
 // Base64 编码函数
@@ -458,7 +537,8 @@ inline T get_relative_best(nlohmann::json *json_data,
 }
 #endif
 
-__device__ inline bool is_in_end(const int64_t id, const int64_t *end_ids,
+__device__ inline bool is_in_end(const int64_t id,
+                                 const int64_t *end_ids,
                                  int length) {
   bool flag = false;
   for (int i = 0; i < length; i++) {
@@ -469,29 +549,26 @@ __device__ inline bool is_in_end(const int64_t id, const int64_t *end_ids,
   return flag;
 }
 
-template <typename T> inline __device__ __host__ T div_up(T m, T n) {
+template <typename T>
+inline __device__ __host__ T div_up(T m, T n) {
   return (m + n - 1) / n;
 }
 
 template <typename T>
 __device__ __inline__ T ClipFunc(const T v, const T min, const T max) {
-  if (v > max)
-    return max;
-  if (v < min)
-    return min;
+  if (v > max) return max;
+  if (v < min) return min;
   return v;
 }
 
 template <typename T>
 static void PrintMatrix3(const T *mat_d, int num, std::string name) {
-
   std::vector<T> tmp(num);
 #ifdef PADDLE_WITH_HIP
   hipMemcpy(tmp.data(), mat_d, sizeof(T) * num, hipMemcpyDeviceToHost);
 #else
   cudaMemcpy(tmp.data(), mat_d, sizeof(T) * num, cudaMemcpyDeviceToHost);
 #endif
-
 
   std::ofstream outfile;
   outfile.open(name + ".txt", std::ios::out);
@@ -501,7 +578,7 @@ static void PrintMatrix3(const T *mat_d, int num, std::string name) {
     if (std::is_same<T, int8_t>::value || std::is_same<T, uint8_t>::value) {
       ss << static_cast<int>(tmp[i]) << std::endl;
     } else {
-      ss << std::setprecision(8) << (float)(tmp[i]) << std::endl; // NOLINT
+      ss << std::setprecision(8) << (float)(tmp[i]) << std::endl;  // NOLINT
     }
   }
   outfile << ss.str();
@@ -530,7 +607,8 @@ __forceinline__ __device__ uint32_t ld_flag_acquire(uint32_t *flag_addr,
 }
 
 __forceinline__ __device__ void st_flag_release(uint32_t *flag_addr,
-                                                uint32_t flag, int mode = 0) {
+                                                uint32_t flag,
+                                                int mode = 0) {
   if (mode == 0) {
     asm volatile("st.release.sys.global.b32 [%1], %0;" ::"r"(flag),
                  "l"(flag_addr));
@@ -546,14 +624,124 @@ __forceinline__ __device__ void st_flag_release(uint32_t *flag_addr,
 inline int get_cuda_max_shared_memory_per_block_opt_in(int const device) {
   int max_shared_mem_per_block_opt_in = 0;
   cudaDeviceGetAttribute(&max_shared_mem_per_block_opt_in,
-                         cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+                         cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                         device);
   return max_shared_mem_per_block_opt_in;
 }
 #endif
 
 inline int GetSMVersion() {
+#ifdef PADDLE_WITH_CUSTOM_DEVICE_METAX_GPU
+  return 80;
+#else
   static int sm_version = phi::backends::gpu::GetGPUComputeCapability(
       phi::backends::gpu::GetCurrentDeviceId());
   return sm_version;
-
+#endif
 }
+
+inline bool GetMlaUseTensorcore() {
+  static const bool flags_mla_use_tensorcore = get_mla_use_tensorcore();
+  static const bool enable_mla_tensorcore = GetSMVersion() >= 90 ? true : false;
+  const bool mla_use_tensorcore =
+      flags_mla_use_tensorcore && enable_mla_tensorcore;
+  return mla_use_tensorcore;
+}
+
+inline const char *getEnvVar(const char *varName) {
+  return std::getenv(varName);
+}
+
+inline bool checkAttentionBackend() {
+  const char *backend = getEnvVar("FD_ATTENTION_BACKEND");
+  if (backend && std::strcmp(backend, "MLA_ATTN") == 0) {
+    return true;
+  }
+  return false;
+}
+
+#ifndef GPU_MEMORY_CHECKER_H
+#define GPU_MEMORY_CHECKER_H
+class GPUMemoryChecker {
+ public:
+  static GPUMemoryChecker *getInstance() {
+    static GPUMemoryChecker instance;
+    return &instance;
+  }
+
+  void addCheckPoint(const char *call_file, int call_line);
+  unsigned int getGPUCount() const { return deviceCount_; }
+  void getCUDAVisibleDevice();
+
+  GPUMemoryChecker(const GPUMemoryChecker &) = delete;
+  void operator=(const GPUMemoryChecker &) = delete;
+
+ private:
+  GPUMemoryChecker();
+  ~GPUMemoryChecker();
+
+  unsigned int deviceCount_;
+  std::vector<unsigned int> visible_device_;
+  std::vector<unsigned int> visible_device_mem_usage_;
+};
+
+#endif  // GPU_MEMORY_CHECKER_H
+__device__ __forceinline__ float warpReduceMax(float value) {
+  value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, 16));
+  value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, 8));
+  value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, 4));
+  value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, 2));
+  value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, 1));
+  return value;
+}
+
+__device__ __forceinline__ float blockReduceMax(float value) {
+  static __shared__ float warpLevelMaxs[WARP_SIZE];
+  const int laneId = threadIdx.x % WARP_SIZE;
+  const int warpId = threadIdx.x / WARP_SIZE;
+
+  value = warpReduceMax(value);
+
+  if (laneId == 0) warpLevelMaxs[warpId] = value;
+  __syncthreads();
+
+  value = (threadIdx.x < blockDim.x / WARP_SIZE) ? warpLevelMaxs[laneId] : 0;
+  if (warpId == 0) value = warpReduceMax(value);
+
+  return value;
+}
+inline bool getBoolEnv(char const *name) {
+  char const *env = std::getenv(name);
+  return env && env[0] == '1' && env[1] == '\0';
+}
+
+bool getEnvEnablePDL();
+
+#ifndef PADDLE_WITH_COREX
+template <typename KernelFn, typename... Args>
+inline void launchWithPdlWhenEnabled(KernelFn kernelFn,
+                                     dim3 grid,
+                                     dim3 block,
+                                     size_t dynamicShmSize,
+                                     cudaStream_t stream,
+                                     Args &&...args) {
+#ifdef PADDLE_WITH_CUSTOM_DEVICE_METAX_GPU
+  (*kernelFn)<<<grid, block, dynamicShmSize, stream>>>(
+      std::forward<Args>(args)...);
+#else
+  cudaLaunchConfig_t kernelConfig;
+  kernelConfig.gridDim = grid;
+  kernelConfig.blockDim = block;
+  kernelConfig.dynamicSmemBytes = dynamicShmSize;
+  kernelConfig.stream = stream;
+
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = getEnvEnablePDL();
+  kernelConfig.attrs = attrs;
+  kernelConfig.numAttrs = 1;
+
+  cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...);
+#endif
+}
+#endif

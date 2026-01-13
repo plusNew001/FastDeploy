@@ -17,36 +17,144 @@
 import argparse
 import asyncio
 import codecs
+import hashlib
 import importlib
+import json
 import logging
 import os
+import pickle
 import random
 import re
 import socket
+import subprocess
 import sys
 import tarfile
 import time
+import traceback
 from datetime import datetime
+from enum import Enum
+from http import HTTPStatus
+from importlib.metadata import PackageNotFoundError, distribution
 from logging.handlers import BaseRotatingHandler
 from pathlib import Path
-from typing import Literal, TypeVar, Union
+from typing import Any, Literal, TypeVar, Union
 
 import numpy as np
 import paddle
 import requests
 import yaml
 from aistudio_sdk.snapshot_download import snapshot_download as aistudio_download
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from tqdm import tqdm
 from typing_extensions import TypeIs, assert_never
 
 from fastdeploy import envs
+from fastdeploy.entrypoints.openai.protocol import ErrorInfo, ErrorResponse
 from fastdeploy.logger.logger import FastDeployLogger
+from fastdeploy.worker.output import PromptLogprobs
 
 T = TypeVar("T")
+from typing import Callable, List, Optional
 
 # [N,2] -> every line is [config_name, enable_xxx_name]
 # Make sure enable_xxx equal to config.enable_xxx
-ARGS_CORRECTION_LIST = [["early_stop_config", "enable_early_stop"], ["graph_optimization_config", "use_cudagraph"]]
+ARGS_CORRECTION_LIST = [
+    ["early_stop_config", "enable_early_stop"],
+]
+
+FASTDEPLOY_SUBCMD_PARSER_EPILOG = (
+    "Tip: Use `fastdeploy [serve|run-batch|bench <bench_type>] "
+    "--help=<keyword>` to explore arguments from help.\n"
+    "   - To view a argument group:     --help=ModelConfig\n"
+    "   - To view a single argument:    --help=max-num-seqs\n"
+    "   - To search by keyword:         --help=max\n"
+    "   - To list all groups:           --help=listgroup\n"
+    "   - To view help with pager:      --help=page"
+)
+
+
+def show_filtered_argument_or_group_from_help(parser: argparse.ArgumentParser, subcommand_name: list[str]):
+
+    # Only handle --help=<keyword> for the current subcommand.
+    # Since subparser_init() runs for all subcommands during CLI setup,
+    # we skip processing if the subcommand name is not in sys.argv.
+    # sys.argv[0] is the program name. The subcommand follows.
+    # e.g., for `vllm bench latency`,
+    # sys.argv is `['vllm', 'bench', 'latency', ...]`
+    # and subcommand_name is "bench latency".
+    if len(sys.argv) <= len(subcommand_name) or sys.argv[1 : 1 + len(subcommand_name)] != subcommand_name:
+        return
+
+    for arg in sys.argv:
+        if arg.startswith("--help="):
+            search_keyword = arg.split("=", 1)[1]
+
+            # Enable paged view for full help
+            if search_keyword == "page":
+                help_text = parser.format_help()
+                _output_with_pager(help_text)
+                sys.exit(0)
+
+            # List available groups
+            if search_keyword == "listgroup":
+                output_lines = ["\nAvailable argument groups:"]
+                for group in parser._action_groups:
+                    if group.title and not group.title.startswith("positional arguments"):
+                        output_lines.append(f"  - {group.title}")
+                        if group.description:
+                            output_lines.append("    " + group.description.strip())
+                        output_lines.append("")
+                _output_with_pager("\n".join(output_lines))
+                sys.exit(0)
+
+            # For group search
+            formatter = parser._get_formatter()
+            for group in parser._action_groups:
+                if group.title and group.title.lower() == search_keyword.lower():
+                    formatter.start_section(group.title)
+                    formatter.add_text(group.description)
+                    formatter.add_arguments(group._group_actions)
+                    formatter.end_section()
+                    _output_with_pager(formatter.format_help())
+                    sys.exit(0)
+
+            # For single arg
+            matched_actions = []
+
+            for group in parser._action_groups:
+                for action in group._group_actions:
+                    # search option name
+                    if any(search_keyword.lower() in opt.lower() for opt in action.option_strings):
+                        matched_actions.append(action)
+
+            if matched_actions:
+                header = f"\nParameters matching '{search_keyword}':\n"
+                formatter = parser._get_formatter()
+                formatter.add_arguments(matched_actions)
+                _output_with_pager(header + formatter.format_help())
+                sys.exit(0)
+
+            print(f"\nNo group or parameter matching '{search_keyword}'")
+            print("Tip: use `--help=listgroup` to view all groups.")
+            sys.exit(1)
+
+
+def _output_with_pager(text: str):
+    """Output text using scrolling view if available and appropriate."""
+
+    pagers = ["less -R", "more"]
+    for pager_cmd in pagers:
+        try:
+            proc = subprocess.Popen(pager_cmd.split(), stdin=subprocess.PIPE, text=True)
+            proc.communicate(input=text)
+            return
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            continue
+
+    # No pager worked, fall back to normal print
+    print(text)
 
 
 class EngineError(Exception):
@@ -55,6 +163,63 @@ class EngineError(Exception):
     def __init__(self, message, error_code=400):
         super().__init__(message)
         self.error_code = error_code
+
+
+class ParameterError(Exception):
+    def __init__(self, param: str, message: str):
+        self.param = param
+        self.message = message
+        super().__init__(message)
+
+
+class ExceptionHandler:
+
+    # 全局异常兜底处理
+    @staticmethod
+    async def handle_exception(request: Request, exc: Exception) -> JSONResponse:
+        error = ErrorResponse(error=ErrorInfo(message=str(exc), type=ErrorType.INTERNAL_ERROR))
+        return JSONResponse(content=error.model_dump(), status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    # 处理请求参数验证异常
+    @staticmethod
+    async def handle_request_validation_exception(request: Request, exc: RequestValidationError) -> JSONResponse:
+        errors = exc.errors()
+        if not errors:
+            message = str(exc)
+            param = None
+        else:
+            first_error = errors[0]
+            loc = first_error.get("loc", [])
+            param = loc[-1] if loc else None
+            message = first_error.get("msg", str(exc))
+        err = ErrorResponse(
+            error=ErrorInfo(
+                message=message,
+                type=ErrorType.INVALID_REQUEST_ERROR,
+                code=ErrorCode.MISSING_REQUIRED_PARAMETER if param == "messages" else ErrorCode.INVALID_VALUE,
+                param=param,
+            )
+        )
+        api_server_logger.error(f"invalid_request_error: {request.url} {param} {message}")
+        return JSONResponse(content=err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
+
+
+class ErrorType(str, Enum):
+    INVALID_REQUEST_ERROR = "invalid_request_error"
+    TIMEOUT_ERROR = "timeout_error"
+    SERVER_ERROR = "server_error"
+    INTERNAL_ERROR = "internal_error"
+    API_CONNECTION_ERROR = "api_connection_error"
+
+
+class ErrorCode(str, Enum):
+    INVALID_VALUE = "invalid_value"
+    CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
+    MODEL_NOT_SUPPORT = "model_not_support"
+    TIMEOUT = "timeout"
+    CONNECTION_ERROR = "connection_error"
+    MISSING_REQUIRED_PARAMETER = "missing_required_parameter"
+    INTERNAL_ERROR = "internal_error"
 
 
 class ColoredFormatter(logging.Formatter):
@@ -192,38 +357,10 @@ class DailyRotatingFileHandler(BaseRotatingHandler):
             os.remove(str(self.base_log_path.with_name(file_name)))
 
 
-# def get_logger(name, file_name, without_formater=False, print_to_console=False):
-#     """
-#     get logger
-#     """
-#     log_dir = envs.FD_LOG_DIR
-#     if not os.path.exists(log_dir):
-#         os.mkdir(log_dir)
-#     is_debug = int(envs.FD_DEBUG)
-#     logger = logging.getLogger(name)
-#     if is_debug:
-#         logger.setLevel(level=logging.DEBUG)
-#     else:
-#         logger.setLevel(level=logging.INFO)
-
-#     for handler in logger.handlers[:]:
-#         logger.removeHandler(handler)
-
-#     LOG_FILE = f"{log_dir}/{file_name}"
-#     backup_count = int(envs.FD_LOG_BACKUP_COUNT)
-#     handler = DailyRotatingFileHandler(LOG_FILE, backupCount=backup_count)
-#     formatter = ColoredFormatter("%(levelname)-8s %(asctime)s %(process)-5s %(filename)s[line:%(lineno)d] %(message)s")
-
-#     console_handler = logging.StreamHandler()
-#     if not without_formater:
-#         handler.setFormatter(formatter)
-#         console_handler.setFormatter(formatter)
-#     logger.addHandler(handler)
-#     if print_to_console:
-#         logger.addHandler(console_handler)
-#     handler.propagate = False
-#     console_handler.propagate = False
-#     return logger
+def chunk_list(lst: list[T], chunk_size: int):
+    """Yield successive chunk_size chunks from lst."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i : i + chunk_size]
 
 
 def str_to_datetime(date_string):
@@ -379,13 +516,24 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
                 config = loaded_config
 
         # Get declared parameters
-        defined_dests = {action.dest for action in self._actions}
-        filtered_config = {k: v for k, v in config.items() if k in defined_dests}
+        defined_actions = {action.dest: action for action in self._actions}
+        filtered_config = {k: v for k, v in config.items() if k in defined_actions}
 
         # Set parameters
         if namespace is None:
             namespace = argparse.Namespace()
         for key, value in filtered_config.items():
+            action = defined_actions[key]
+            if action.type is not None and isinstance(value, (str, int, float)):
+                try:
+                    str_value = str(value).strip()
+                    if str_value == "":
+                        converted = None
+                    else:
+                        converted = action.type(str_value)
+                    value = converted
+                except Exception as e:
+                    llm_logger.error(f"Error converting '{key}' with value '{value}': {e}")
             setattr(namespace, key, value)
         args = super().parse_args(args=remaining_args, namespace=namespace)
 
@@ -456,6 +604,19 @@ def get_random_port():
                 continue
 
 
+def parse_ports(ports):
+    if ports is None:
+        return None
+    elif isinstance(ports, int):
+        return [ports]
+    elif isinstance(ports, str):
+        return [int(p) for p in ports.split(",")]
+    elif isinstance(ports, list):
+        return [int(p) for p in ports]
+    else:
+        raise TypeError(f"Cannot parse ports into List[int]: {ports}")
+
+
 def is_port_available(host, port):
     """
     Check the port is available
@@ -472,6 +633,57 @@ def is_port_available(host, port):
             if e.errno == errno.EADDRINUSE:
                 return False
             return True
+
+
+def find_free_ports(
+    port_range: tuple[int, int] = (8000, 65535),
+    num_ports: int = 1,
+    host: str = "0.0.0.0",
+) -> list[int]:
+    """
+    Find available TCP ports in a given range, scanning from a random start.
+
+    Args:
+        port_range: (start, end), inclusive, e.g. (20000, 30000).
+        num_ports: number of ports to find.
+        host: host to bind, default "0.0.0.0".
+
+    Returns:
+        List of available ports with length == num_ports.
+
+    Raises:
+        ValueError: invalid port range or num_ports <= 0.
+        RuntimeError: not enough free ports in the range.
+    """
+    start, end = port_range
+    if start < 0 or end > 65535 or start > end:
+        raise ValueError(f"Invalid port range: {port_range}")
+
+    if num_ports <= 0:
+        raise ValueError("num_ports must be a positive integer")
+
+    total_ports = end - start + 1
+    if num_ports > total_ports:
+        raise ValueError("num_ports is larger than range size")
+
+    # Generate all ports and rotate with a random start index
+    ports = list(range(start, end + 1))
+    offset = random.randint(0, total_ports - 1)
+    ports = ports[offset:] + ports[:offset]
+
+    free_ports: list[int] = []
+
+    for port in ports:
+        if is_port_available(host, port):
+            free_ports.append(port)
+
+        if len(free_ports) >= num_ports:
+            break
+
+    if len(free_ports) < num_ports:
+        raise RuntimeError(f"Only found {len(free_ports)} free ports in {port_range}, requested {num_ports}.")
+
+    return free_ports
 
 
 def singleton(cls):
@@ -497,11 +709,20 @@ def print_gpu_memory_use(gpu_id: int, title: str) -> None:
     meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
     pynvml.nvmlShutdown()
 
+    paddle_max_reserved = paddle.device.cuda.max_memory_reserved(gpu_id)
+    paddle_max_allocated = paddle.device.cuda.max_memory_allocated(gpu_id)
+    paddle_reserved = paddle.device.cuda.memory_reserved(gpu_id)
+    paddle_allocated = paddle.device.cuda.memory_allocated(gpu_id)
+
     print(
         f"\n{title}:",
-        f"\n\tDevice Total memory: {meminfo.total}",
-        f"\n\tDevice Used memory: {meminfo.used}",
-        f"\n\tDevice Free memory: {meminfo.free}",
+        f"\n\tDevice Total memory(GiB): {meminfo.total / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tDevice Used memory(GiB): {meminfo.used / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tDevice Free memory(GiB): {meminfo.free / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tPaddle max memory Reserved(GiB): {paddle_max_reserved / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tPaddle max memory Allocated(GiB): {paddle_max_allocated / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tPaddle memory Reserved(GiB): {paddle_reserved / 1024.0 / 1024.0 / 1024.0}",
+        f"\n\tPaddle memory Allocated(GiB): {paddle_allocated / 1024.0 / 1024.0 / 1024.0}",
     )
 
 
@@ -604,6 +825,18 @@ def retrive_model_from_server(model_name_or_path, revision="master"):
     return model_name_or_path
 
 
+def get_hash_str(token_ids: List[int], extra_keys: Optional[Any] = []) -> str:
+    """
+    calculate hash value of a block with additional keys
+
+    Args:
+        token_ids: Input token IDs
+        extra_keys: Additional keys for block identification
+    """
+    value = (token_ids, extra_keys)
+    return hashlib.sha256(pickle.dumps(value)).hexdigest()
+
+
 def is_list_of(
     value: object,
     typ: Union[type[T], tuple[type[T], ...]],
@@ -648,6 +881,14 @@ def import_from_path(module_name: str, file_path: Union[str, os.PathLike]):
     return module
 
 
+def is_package_installed(package_name):
+    try:
+        distribution(package_name)
+        return True
+    except PackageNotFoundError:
+        return False
+
+
 def version():
     """
     Prints the contents of the version.txt file located in the parent directory of this script.
@@ -662,6 +903,67 @@ def version():
     except FileNotFoundError:
         llm_logger.error("[version.txt] Not Found!")
     return content
+
+
+def get_version_info():
+    """
+    Read version.txt file and parse version information, returning as a dict structure.
+
+    Returns:
+        dict: A dictionary containing version information, or None if the file does not exist
+        The dictionary contains the following keys:
+        - 'fastdeploy_commit': FastDeploy GIT COMMIT ID
+        - 'paddle_version': Paddle version
+        - 'paddle_commit': Paddle GIT COMMIT ID
+        - 'cuda_version': CUDA version
+        - 'cxx_version': CXX compiler version
+        - 'fastdeploy_version': fastdeploy version
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    version_file_path = os.path.join(current_dir, "version.txt")
+
+    try:
+        with open(version_file_path, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return None
+
+    version_info = {}
+    try:
+        lines = content.strip().split("\n")
+        for line in lines:
+            if line.startswith("fastdeploy GIT COMMIT ID:"):
+                version_info["fastdeploy_commit"] = line.split("fastdeploy GIT COMMIT ID:")[1].strip()
+            elif line.startswith("Paddle version:"):
+                version_info["paddle_version"] = line.split("Paddle version:")[1].strip()
+            elif line.startswith("Paddle GIT COMMIT ID:"):
+                version_info["paddle_commit"] = line.split("Paddle GIT COMMIT ID:")[1].strip()
+            elif line.startswith("CUDA version:"):
+                version_info["cuda_version"] = line.split("CUDA version:")[1].strip()
+            elif line.startswith("CXX compiler version:"):
+                version_info["cxx_version"] = line.split("CXX compiler version:")[1].strip()
+            elif line.startswith("fastdeploy version:"):
+                version_info["fastdeploy_version"] = line.split("fastdeploy version:")[1].strip()
+    except Exception as e:
+        console_logger.error(f"Failed to parse version info from version.txt: {e}")
+        return None
+
+    return version_info if version_info else None
+
+
+def current_package_version():
+    """
+    Read version.txt file and parse the fastdeploy version number.
+
+    Args:
+    Returns:
+        str: fastdeploy version number, or "Unknown" if parsing fails
+    """
+    version_info = get_version_info()
+    if version_info is None:
+        return "Unknown"
+
+    return version_info.get("fastdeploy_version", "Unknown")
 
 
 class DeprecatedOptionWarning(argparse.Action):
@@ -737,10 +1039,112 @@ class StatefulSemaphore:
         }
 
 
+def parse_quantization(value: str):
+    """
+    Parse a JSON string into a dictionary.
+    """
+    try:
+        return json.loads(value)
+    except ValueError:
+        return {"quantization": value}
+
+
 # 日志使用全局访问点（兼容原有使用方式）
 def get_logger(name, file_name=None, without_formater=False, print_to_console=False):
     """全局函数包装器，保持向后兼容"""
     return FastDeployLogger().get_logger(name, file_name, without_formater, print_to_console)
+
+
+def check_download_links(bos_client, links, timeout=1):
+    """
+    check bos download links
+    """
+    for link in links:
+        try:
+            if link.startswith("bos://"):
+                link = link.replace("bos://", "")
+
+            bucket_name = "/".join(link.split("/")[1:-1])
+            object_key = link.split("/")[-1]
+            response = bos_client.get_object_meta_data(bucket_name, object_key)
+            assert (
+                int(response.metadata.content_length) > 0
+            ), f"bos download length error, {response.metadata.content_length}"
+        except Exception as e:
+            return f"link {link} download error: {str(e)}"
+    return None
+
+
+def init_bos_client():
+    from baidubce.auth.bce_credentials import BceCredentials
+    from baidubce.bce_client_configuration import BceClientConfiguration
+    from baidubce.services.bos.bos_client import BosClient
+
+    cfg = BceClientConfiguration(
+        credentials=BceCredentials(envs.ENCODE_FEATURE_BOS_AK, envs.ENCODE_FEATURE_BOS_SK),
+        endpoint=envs.ENCODE_FEATURE_ENDPOINT,
+    )
+
+    try:
+        client = BosClient(cfg)
+        client.list_buckets()
+    except Exception as e:
+        raise Exception(
+            "Create BOSClient Error, Please check your ENV [ ENCODE_FEATURE_BOS_AK, ENCODE_FEATURE_BOS_SK, ENCODE_FEATURE_ENDPOINT ] \n"
+            f"Current ENV AK: {envs.ENCODE_FEATURE_BOS_AK}, SK: {envs.ENCODE_FEATURE_BOS_SK}, Endpoint: {envs.ENCODE_FEATURE_ENDPOINT} \n"
+            f"{str(e)}"
+        )
+    return client
+
+
+def download_from_bos(bos_client, bos_links, retry: int = 0):
+    """
+    Download pickled objects from Baidu Object Storage (BOS).
+    Args:
+        bos_client: BOS client instance
+        bos_links: Single link or list of BOS links in format "bos://bucket-name/path/to/object"
+        retry: Number of times to retry on failure (only retries on network-related errors)
+    Yields:
+        tuple: (success: bool, data: np.ndarray | error_msg: str)
+            - On success: (True, deserialized_data)
+            - On failure: (False, error_message) and stops processing remaining links
+    Security Note:
+        Uses pickle deserialization. Only use with trusted data sources.
+    """
+
+    def _bos_download(bos_client, link):
+        if link.startswith("bos://"):
+            link = link.replace("bos://", "")
+
+        bucket_name = "/".join(link.split("/")[1:-1])
+        object_key = link.split("/")[-1]
+        return bos_client.get_object_as_string(bucket_name, object_key)
+
+    if not isinstance(bos_links, list):
+        bos_links = [bos_links]
+
+    for link in bos_links:
+        try:
+            response = _bos_download(bos_client, link)
+            yield True, pickle.loads(response)
+        except Exception:
+            # Only retry on network-related or timeout exceptions
+            exceptions_msg = str(traceback.format_exc())
+
+            if "request rate is too high" not in exceptions_msg or retry <= 0:
+                yield False, f"Failed to download {link}: {exceptions_msg}"
+                break
+
+            for attempt in range(retry):
+                try:
+                    llm_logger.warning(f"Retry attempt {attempt + 1}/{retry} for {link}")
+                    response = _bos_download(bos_client, link)
+                    yield True, pickle.loads(response)
+                    break
+                except Exception:
+                    if attempt == retry - 1:  # Last attempt failed
+                        yield False, f"Failed after {retry} retries for {link}: {str(traceback.format_exc())}"
+            break
 
 
 llm_logger = get_logger("fastdeploy", "fastdeploy.log")
@@ -749,3 +1153,135 @@ scheduler_logger = get_logger("scheduler", "scheduler.log")
 api_server_logger = get_logger("api_server", "api_server.log")
 console_logger = get_logger("console", "console.log", print_to_console=True)
 spec_logger = get_logger("speculate", "speculate.log")
+zmq_client_logger = get_logger("zmq_client", "zmq_client.log")
+trace_logger = FastDeployLogger().get_trace_logger("trace", "trace.log")
+router_logger = get_logger("router", "router.log")
+fmq_logger = get_logger("fmq", "fmq.log")
+
+
+def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
+
+    def _parse_type(val: str) -> T:
+        try:
+            return return_type(val)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(f"Value {val} cannot be converted to {return_type}.") from e
+
+    return _parse_type
+
+
+def optional_type(return_type: Callable[[str], T]) -> Callable[[str], Optional[T]]:
+
+    def _optional_type(val: str) -> Optional[T]:
+        if val == "" or val == "None":
+            return None
+        return parse_type(return_type)(val)
+
+    return _optional_type
+
+
+def clamp_prompt_logprobs(
+    prompt_logprobs: PromptLogprobs | None,
+) -> PromptLogprobs | None:
+    if prompt_logprobs is None:
+        return prompt_logprobs
+
+    for logprob_dict in prompt_logprobs:
+        if logprob_dict is None:
+            continue
+        for logprob_values in logprob_dict.values():
+            if logprob_values.logprob == float("-inf"):
+                logprob_values.logprob = -9999.0
+    return prompt_logprobs
+
+
+def to_numpy(tasks: List[Any]):
+    """
+    Convert PaddlePaddle tensors in multimodal inputs to NumPy arrays.
+
+    Args:
+        tasks: List of tasks containing multimodal inputs.
+    """
+    try:
+        for task in tasks:
+            if not hasattr(task, "multimodal_inputs"):
+                continue
+            images = task.multimodal_inputs.get("images", None)
+            if isinstance(images, paddle.Tensor):
+                llm_logger.debug(f"Convert image to numpy, shape: {images.shape}")
+                task.multimodal_inputs["images"] = images.numpy()
+
+            list_keys = [
+                "image_features",
+                "video_features",
+                "audio_features",
+            ]
+            for key in list_keys:
+                value = task.multimodal_inputs.get(key, None)
+                if value is None:
+                    continue
+                if isinstance(value, list):
+                    task.multimodal_inputs[key] = [v.numpy() for v in value]
+    except Exception as e:
+        llm_logger.warning(f"Failed to convert to numpy: {e}")
+
+
+def to_tensor(tasks: List[Any]):
+    """
+    Convert NumPy arrays in multimodal inputs to Paddle tensors.
+
+    Args:
+        tasks (tuple): ([request], bsz)
+    """
+    try:
+        for task in tasks:
+            multimodal_inputs = getattr(task, "multimodal_inputs", None)
+            if not multimodal_inputs:
+                continue
+            # tensor keys
+            tensor_keys = [
+                "images",
+                "patch_idx",
+                "token_type_ids",
+                "position_ids",
+                "attention_mask_offset",
+            ]
+
+            list_keys = [
+                "image_features",
+                "video_features",
+                "audio_features",
+            ]
+
+            llm_logger.debug(f"Converting multimodal inputs to tensor...{tensor_keys + list_keys}")
+
+            for key in tensor_keys:
+                value = multimodal_inputs.get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, paddle.Tensor):
+                    multimodal_inputs[key] = paddle.to_tensor(value)
+
+            for key in list_keys:
+                value = multimodal_inputs.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, list):
+                    multimodal_inputs[key] = [paddle.to_tensor(v) for v in value]
+    except Exception as e:
+        llm_logger.warning(f"Tensor conversion failed: {type(e).__name__}: {e}")
+
+
+def do_nothing(*args, **kwargs):
+    def decorator(func):
+        return func
+
+    return decorator
+
+
+if hasattr(paddle.static, "register_op"):
+    from paddle.static import register_op
+else:
+    register_op = do_nothing
+
+register_custom_python_op = register_op

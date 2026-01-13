@@ -20,6 +20,7 @@ import paddle
 
 import fastdeploy
 
+from ..moe import FusedMoE
 from .quant_base import QuantConfigBase, QuantMethodBase
 
 QUANT_SCALING_FACTOR = 448
@@ -30,24 +31,37 @@ class W4AFP8Config(QuantConfigBase):
     quantization config for weight 4bits and activation fp8
     """
 
-    def __init__(self, weight_scale_dict, act_scale_dict) -> None:
+    def __init__(self, weight_scale_dict, act_scale_dict, is_permuted, hadamard_block_size, is_quantized) -> None:
         super().__init__()
         self.weight_scale_dict = weight_scale_dict
         self.act_scale_dict = act_scale_dict
         self.quant_max_bound = 448
         self.quant_min_bound = -448
         self.quant_round_type = 1
+        self.is_permuted = is_permuted
+        self.hadamard_block_size = hadamard_block_size
+        self.is_quantized = is_quantized
+        self.is_checkpoint_bf16 = not is_quantized
 
     def name(self) -> str:
         return "w4afp8"
 
     @classmethod
     def from_config(cls, config: dict) -> "W4AFP8Config":
-        weight_scale_dict = config["weight_scale_dict"]
-        act_scale_dict = config["act_scale_dict"]
-        return cls(weight_scale_dict, act_scale_dict)
+        weight_scale_dict = config.get("weight_scale_dict", None)
+        act_scale_dict = config.get("act_scale_dict", None)
+        is_permuted = config.get("is_permuted", True)
+        hadamard_block_size = config.get("hadamard_block_size", 128)
+        is_quantized = config.get("is_quantized", False)
+        return cls(weight_scale_dict, act_scale_dict, is_permuted, hadamard_block_size, is_quantized)
 
     def get_quant_method(self, layer) -> Optional[QuantMethodBase]:
+        if isinstance(layer, FusedMoE):
+            from fastdeploy.model_executor.layers.moe.fused_moe_cutlass_backend import (
+                CutlassW4AFP8MoEMethod,
+            )
+
+            return CutlassW4AFP8MoEMethod(self)
         return W4AFP8LinearMethod(self)
 
 
@@ -94,7 +108,7 @@ class W4AFP8LinearMethod(QuantMethodBase):
             layer.weight,
             layer.weight_scale,
             zero_points=None,
-            bias=layer.bias if layer.add_bias else None,
+            bias=layer.bias if layer.with_bias else None,
             out_scale=self.quant_config.weight_scale_dict.get(layer.prefix + ".weight_scale")
             / (
                 self.quant_config.act_scale_dict.get(layer.prefix + ".activation_scale")

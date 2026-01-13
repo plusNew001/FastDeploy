@@ -69,14 +69,6 @@ class MLAAttentionMetadata(AttentionMetadata):
     MLAAttentionMetadata for Multi-Layer Attention
     """
 
-    encoder_batch_ids: paddle.Tensor = None
-    encoder_tile_ids_per_batch: paddle.Tensor = None
-    encoder_num_blocks: paddle.Tensor = None
-    kv_batch_ids: paddle.Tensor = None
-    kv_tile_ids_per_batch: paddle.Tensor = None
-    kv_num_blocks: paddle.Tensor = None
-    max_len_kv: paddle.Tensor = None
-
     _dtype: paddle.dtype = paddle.bfloat16
     encoder_max_partition_size: int = 32768
     max_partition_size: int = 32768
@@ -88,6 +80,10 @@ class MLAAttentionMetadata(AttentionMetadata):
     # pd_disaggregation
     kv_signal_metadata: Optional[paddle.Tensor] = None
     kv_signal_data_list: List[Optional[paddle.Tensor]] = field(default_factory=list)
+
+    max_enc_len_this_time: Optional[paddle.Tensor] = None
+    max_dec_len_this_time: Optional[paddle.Tensor] = None
+    max_kv_len_this_time: Optional[paddle.Tensor] = None
 
 
 class MLAAttentionBackend(AttentionBackend):
@@ -116,7 +112,7 @@ class MLAAttentionBackend(AttentionBackend):
 
         # 基础配置
         self.block_size: int = fd_config.cache_config.block_size
-        self.max_seq_len: int = fd_config.parallel_config.max_model_len
+        self.max_seq_len: int = fd_config.model_config.max_model_len
         self.rope_theta: float = (
             10000.0 if fd_config.model_config.rope_theta is None else fd_config.model_config.rope_theta
         )
@@ -128,13 +124,9 @@ class MLAAttentionBackend(AttentionBackend):
         self.keep_pd_step_flag: bool = fd_config.speculative_config.model_type == "mtp"
         self.num_layers_draft_model: int = int(fd_config.speculative_config.method in ["mtp"])
 
-        self.kv_num_heads: int = kv_num_heads
         self.num_heads: int = num_heads
-        self.group_size: int = self.num_heads // self.kv_num_heads
         self.head_dim: int = fd_config.model_config.head_dim
         self.num_layers: int = fd_config.model_config.num_hidden_layers
-        self.encoder_block_shape_q: int = encoder_block_shape_q
-        self.decoder_block_shape_q: int = decoder_block_shape_q
 
         # For Multi Head Latent Attention
         self.kv_lora_rank: int = fd_config.model_config.kv_lora_rank
@@ -153,6 +145,8 @@ class MLAAttentionBackend(AttentionBackend):
         self.device_id: int = os.getenv("CUDA_VISIBLE_DEVICES", None)
 
         self.rank, self.device_id = init_rank_and_device_id(fd_config)
+
+        self.useless_tensor = paddle.randn([1]).cast("int32")
 
         if self.flash_attn_func is None:
             prop = paddle.device.cuda.get_device_properties()
@@ -188,37 +182,36 @@ class MLAAttentionBackend(AttentionBackend):
         metadata.attn_mask = forward_meta.attn_mask
         metadata.pre_caches_length = forward_meta.pre_caches_length
 
-        (
-            metadata.encoder_batch_ids,
-            metadata.encoder_tile_ids_per_batch,
-            metadata.encoder_num_blocks,
-            metadata.kv_batch_ids,
-            metadata.kv_tile_ids_per_batch,
-            metadata.kv_num_blocks,
-            metadata.max_len_kv,
-        ) = get_block_shape_and_split_kv_block(
+        get_block_shape_and_split_kv_block(
             forward_meta.seq_lens_encoder,
             forward_meta.seq_lens_decoder,
             forward_meta.seq_lens_this_time,
             forward_meta.decoder_batch_ids,
             forward_meta.decoder_tile_ids_per_batch,
-            forward_meta.decoder_num_blocks_cpu,
+            self.useless_tensor,  # not used in mla
+            forward_meta.decoder_num_blocks_device,
+            forward_meta.decoder_chunk_size_device,
             forward_meta.max_len_tensor_cpu,
-            self.encoder_block_shape_q,
-            self.decoder_block_shape_q,
-            self.group_size,
+            self.useless_tensor,  # not used in mla
+            self.useless_tensor,  # not used in mla
+            self.useless_tensor,  # not used in mla
+            forward_meta.kv_batch_ids,
+            forward_meta.kv_tile_ids_per_batch,
+            forward_meta.kv_num_blocks_x_cpu,
+            -1,  # not need.
+            -1,  # not need.
+            -1,  # not need.
             self.block_size,
-            self.speculate_max_draft_token_num + 1,
         )
-
         # MLA
         metadata.max_enc_len_this_time = forward_meta.max_len_tensor_cpu[1]
         metadata.max_dec_len_this_time = forward_meta.max_len_tensor_cpu[2]
+        metadata.max_kv_len_this_time = forward_meta.max_len_tensor_cpu[5]
 
         # pd_disaggregation
         metadata.kv_signal_data_list = [None] * self.num_layers
         if self.pd_disaggregation_mode == "per_chunk":
-            if not self.keep_pd_step_flag:
+            if not self.keep_pd_step_flag and not forward_meta.is_dummy_or_profile_run:
                 init_kv_signal_per_query(
                     forward_meta.seq_lens_encoder,
                     forward_meta.seq_lens_this_time,
@@ -245,12 +238,9 @@ class MLAAttentionBackend(AttentionBackend):
         """
         Calculate kv cache shape for MLA
         """
-        return (
-            max_num_blocks,
-            1,
-            self.block_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-        )
+        key_cache_shape = [max_num_blocks, 1, self.block_size, self.kv_lora_rank + self.qk_rope_head_dim]
+        value_cache_shape = []
+        return key_cache_shape, value_cache_shape
 
     def forward_extend(
         self,
@@ -286,6 +276,7 @@ class MLAAttentionBackend(AttentionBackend):
             forward_meta.batch_id_per_token,
             forward_meta.cu_seqlens_q,
             metadata.block_tables,
+            metadata.kv_signal_data_list[layer.layer_id],
             "none",
             getattr(forward_meta, "max_input_length", -1),
         )
@@ -353,25 +344,20 @@ class MLAAttentionBackend(AttentionBackend):
             q,
             latent_cache,
             latent_cache,
-            forward_meta.seq_lens_encoder,
             forward_meta.seq_lens_decoder,
             forward_meta.seq_lens_this_time,
             forward_meta.cu_seqlens_q,
             forward_meta.batch_id_per_token,
             metadata.block_tables,
-            metadata.encoder_batch_ids,
-            metadata.encoder_tile_ids_per_batch,
-            metadata.encoder_num_blocks,
-            metadata.kv_batch_ids,
-            metadata.kv_tile_ids_per_batch,
-            metadata.kv_num_blocks,
+            forward_meta.kv_batch_ids,
+            forward_meta.kv_tile_ids_per_batch,
+            forward_meta.kv_num_blocks_x_cpu,
             forward_meta.decoder_batch_ids,
             forward_meta.decoder_tile_ids_per_batch,
-            forward_meta.decoder_num_blocks_cpu,
-            forward_meta.decoder_num_blocks_cpu,
-            metadata.max_enc_len_this_time,
+            forward_meta.decoder_num_blocks_device,
+            forward_meta.decoder_chunk_size_device,
             metadata.max_dec_len_this_time,
-            metadata.max_len_kv,
+            metadata.max_kv_len_this_time,
             None,  # attn_mask
             None,  # qkv_bias
             None,  # qkv_out_scales
@@ -434,10 +420,10 @@ class MLAAttentionBackend(AttentionBackend):
                 forward_meta.batch_id_per_token,
                 forward_meta.cu_seqlens_q,
                 metadata.block_tables,
+                metadata.kv_signal_data_list[layer.layer_id],
                 "none",
                 self.max_seq_len,
             )
-
             # FA
             fmha_out = self.flash_attn_func(
                 q,
@@ -474,25 +460,20 @@ class MLAAttentionBackend(AttentionBackend):
                 q,
                 latent_cache,
                 latent_cache,
-                forward_meta.seq_lens_encoder,
                 forward_meta.seq_lens_decoder,
                 forward_meta.seq_lens_this_time,
                 forward_meta.cu_seqlens_q,
                 forward_meta.batch_id_per_token,
                 metadata.block_tables,
-                metadata.encoder_batch_ids,
-                metadata.encoder_tile_ids_per_batch,
-                metadata.encoder_num_blocks,
-                metadata.kv_batch_ids,
-                metadata.kv_tile_ids_per_batch,
-                metadata.kv_num_blocks,
+                forward_meta.kv_batch_ids,
+                forward_meta.kv_tile_ids_per_batch,
+                forward_meta.kv_num_blocks_x_cpu,
                 forward_meta.decoder_batch_ids,
                 forward_meta.decoder_tile_ids_per_batch,
-                forward_meta.decoder_num_blocks_cpu,
-                forward_meta.decoder_num_blocks_cpu,
-                metadata.max_enc_len_this_time,
+                forward_meta.decoder_num_blocks_device,
+                forward_meta.decoder_chunk_size_device,
                 metadata.max_dec_len_this_time,
-                metadata.max_len_kv,
+                metadata.max_kv_len_this_time,
                 None,  # attn_mask
                 None,  # qkv_bias
                 None,  # qkv_out_scales

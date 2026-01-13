@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from functools import partial
 from typing import Dict, Union
 
@@ -44,10 +45,16 @@ from fastdeploy.model_executor.layers.linear import (
 from fastdeploy.model_executor.layers.lm_head import ParallelLMHead
 from fastdeploy.model_executor.layers.moe.moe import FusedMoE
 from fastdeploy.model_executor.layers.normalization import RMSNorm
-from fastdeploy.model_executor.models.model_base import ModelForCasualLM
+from fastdeploy.model_executor.models.model_base import (
+    ModelCategory,
+    ModelForCasualLM,
+    ModelRegistry,
+)
 from fastdeploy.model_executor.models.tp_utils import TensorSplitMode as tsm
 from fastdeploy.model_executor.models.utils import LayerIdPlaceholder as layerid
 from fastdeploy.model_executor.models.utils import WeightMeta
+from fastdeploy.platforms import current_platform
+from fastdeploy.worker.experts_manager import RedundantExpertManger
 
 
 class Ernie4_5_MLP(nn.Layer):
@@ -59,7 +66,6 @@ class Ernie4_5_MLP(nn.Layer):
         reduce_results: bool = True,
     ) -> None:
         super().__init__()
-        self.nranks = fd_config.parallel_config.tensor_parallel_size
         self.up_gate_proj = MergedColumnParallelLinear(
             fd_config=fd_config,
             prefix=f"{prefix}.up_gate_proj",
@@ -88,7 +94,7 @@ class Ernie4_5_MLP(nn.Layer):
         self.up_gate_proj.load_state_dict(state_dict)
         self.down_proj.load_state_dict(state_dict)
 
-    def forward(self, hidden_states: paddle.Tensor):
+    def forward(self, hidden_states: paddle.Tensor, forward_meta: ForwardMeta = None):
         gate_up_out = self.up_gate_proj(hidden_states)
         act_out = self.act_fn(gate_up_out)
         down_out = self.down_proj(act_out)
@@ -96,13 +102,19 @@ class Ernie4_5_MLP(nn.Layer):
 
 
 class Ernie4_5_MoE(nn.Layer):
-    def __init__(self, fd_config: FDConfig, layer_id: int, prefix: str) -> None:
+    def __init__(
+        self, fd_config: FDConfig, layer_id: int, prefix: str, redundant_table_manger: RedundantExpertManger = None
+    ) -> None:
         super().__init__()
         moe_quant_type = ""
         if hasattr(fd_config.quant_config, "moe_quant_type"):
             moe_quant_type = fd_config.quant_config.moe_quant_type
 
-        if moe_quant_type == "w4a8":
+        if moe_quant_type == "w4a8" or (
+            moe_quant_type == "w4afp8"
+            and fd_config.model_config.is_quantized
+            and not fd_config.quant_config.moe_dynamic_quant
+        ):
             weight_key_map = {
                 "gate_weight_key": f"{prefix}.gate.weight",
                 "gate_correction_bias_key": f"{prefix}.moe_statics.e_score_correction_bias",
@@ -112,6 +124,19 @@ class Ernie4_5_MoE(nn.Layer):
                 "down_proj_expert_weight_scale_key": f"{prefix}.experts.{{}}.down_proj.weight_scale",
                 "up_gate_proj_expert_in_scale_key": f"{prefix}.experts.{{}}.up_gate_proj.activation_scale",
                 "down_proj_expert_in_scale_key": f"{prefix}.experts.{{}}.down_proj.activation_scale",
+            }
+        elif (
+            moe_quant_type == "w4afp8"
+            and fd_config.model_config.is_quantized
+            and fd_config.quant_config.moe_dynamic_quant
+        ):
+            weight_key_map = {
+                "gate_weight_key": f"{prefix}.gate.weight",
+                "gate_correction_bias_key": f"{prefix}.moe_statics.e_score_correction_bias",
+                "up_gate_proj_expert_weight_key": f"{prefix}.experts.{{}}.up_gate_proj.quant_weight",
+                "down_proj_expert_weight_key": f"{prefix}.experts.{{}}.down_proj.quant_weight",
+                "up_gate_proj_expert_weight_scale_key": f"{prefix}.experts.{{}}.up_gate_proj.weight_scale",
+                "down_proj_expert_weight_scale_key": f"{prefix}.experts.{{}}.down_proj.weight_scale",
             }
         elif moe_quant_type == "w4w2":
             weight_key_map = {
@@ -129,7 +154,8 @@ class Ernie4_5_MoE(nn.Layer):
                 "down_proj_expert_code_zp_key": f"{prefix}.experts.{{}}.down_proj.code_zp",
             }
         elif moe_quant_type == "tensor_wise_fp8" or (
-            moe_quant_type == "block_wise_fp8" and fd_config.model_config.is_quantized
+            moe_quant_type == "block_wise_fp8"
+            and (fd_config.model_config.is_quantized or fd_config.model_config.is_moe_quantized)
         ):
             weight_key_map = {
                 "gate_weight_key": f"{prefix}.gate.weight",
@@ -149,15 +175,6 @@ class Ernie4_5_MoE(nn.Layer):
                 "down_proj_expert_weight_key": f"{prefix}.experts.{{}}.down_proj.weight",
             }
 
-        self.experts = FusedMoE(
-            fd_config=fd_config,
-            moe_intermediate_size=fd_config.model_config.moe_intermediate_size,
-            num_experts=fd_config.model_config.moe_num_experts,
-            top_k=fd_config.model_config.moe_k,
-            layer_idx=layer_id,
-            weight_key_map=weight_key_map,
-        )
-
         self.gate = ReplicatedLinear(
             fd_config=fd_config,
             prefix=f"{prefix}.gate",
@@ -167,6 +184,26 @@ class Ernie4_5_MoE(nn.Layer):
             skip_quant=True,
             weight_dtype="float32",
         )
+
+        self.experts = FusedMoE(
+            fd_config=fd_config,
+            moe_intermediate_size=fd_config.model_config.moe_intermediate_size,
+            num_experts=fd_config.model_config.moe_num_experts,
+            top_k=fd_config.model_config.moe_k,
+            layer_idx=layer_id,
+            gate_correction_bias=None,
+            redundant_table_manger=redundant_table_manger,
+            weight_key_map=weight_key_map,
+        )
+
+        if fd_config.model_config.moe_use_aux_free:
+            self.experts.gate_correction_bias = self.create_parameter(
+                shape=[1, fd_config.model_config.moe_num_experts],
+                dtype="float32",
+                default_initializer=paddle.nn.initializer.Constant(0),
+            )
+        else:
+            self.experts.gate_correction_bias = None
 
         self.num_shared_experts = fd_config.model_config.moe_num_shared_experts
         if self.num_shared_experts > 0:
@@ -180,11 +217,30 @@ class Ernie4_5_MoE(nn.Layer):
     def load_state_dict(self, state_dict):
         self.gate.load_state_dict(state_dict)
         self.experts.load_state_dict(state_dict)
+        if self.experts.gate_correction_bias is not None:
+            gate_correction_bias_tensor = state_dict.pop(self.experts.gate_correction_bias_key)
+            if self.experts.gate_correction_bias.shape != gate_correction_bias_tensor.shape:
+                gate_correction_bias_tensor = gate_correction_bias_tensor.reshape(
+                    self.experts.gate_correction_bias.shape
+                )
+            self.experts.gate_correction_bias.set_value(gate_correction_bias_tensor)
         if self.num_shared_experts > 0:
             self.shared_experts.load_state_dict(state_dict)
 
-    def forward(self, hidden_states: paddle.Tensor):
-        out = self.experts(hidden_states, self.gate)
+    def update_state_dict(self, state_dict):
+        self.experts.load_state_dict(state_dict, True)
+
+    def forward(
+        self,
+        hidden_states: paddle.Tensor,
+        forward_meta: ForwardMeta,
+    ):
+        out = self.experts(
+            x=hidden_states,
+            gate=self.gate,
+            forward_meta=forward_meta,
+        )
+
         if self.num_shared_experts > 0:
             s_x = self.shared_experts(hidden_states)
             out = out + s_x
@@ -205,6 +261,7 @@ class Ernie4_5_Attention(nn.Layer):
             prefix=f"{prefix}.o_proj",
             input_size=fd_config.model_config.head_dim * fd_config.model_config.num_attention_heads,
             output_size=fd_config.model_config.hidden_size,
+            layer_id=layer_id,
         )
         self.attn = Attention(
             fd_config=fd_config,
@@ -239,6 +296,7 @@ class Ernie4_5_DecoderLayer(nn.Layer):
     def __init__(
         self,
         fd_config: FDConfig,
+        redundant_table_manger: RedundantExpertManger = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -257,6 +315,7 @@ class Ernie4_5_DecoderLayer(nn.Layer):
             self.mlp = Ernie4_5_MoE(
                 fd_config=fd_config,
                 layer_id=layer_id,
+                redundant_table_manger=redundant_table_manger,
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -271,6 +330,7 @@ class Ernie4_5_DecoderLayer(nn.Layer):
             hidden_size=fd_config.model_config.hidden_size,
             eps=fd_config.model_config.rms_norm_eps,
             prefix=f"{prefix}.input_layernorm",
+            layer_id=layer_id,
         )
 
         self.post_attention_layernorm = RMSNorm(
@@ -278,6 +338,7 @@ class Ernie4_5_DecoderLayer(nn.Layer):
             hidden_size=fd_config.model_config.hidden_size,
             eps=fd_config.model_config.rms_norm_eps,
             prefix=f"{prefix}.post_attention_layernorm",
+            layer_id=layer_id,
         )
 
     def load_state_dict(self, state_dict):
@@ -286,26 +347,33 @@ class Ernie4_5_DecoderLayer(nn.Layer):
         self.input_layernorm.load_state_dict(state_dict)
         self.post_attention_layernorm.load_state_dict(state_dict)
 
+    def update_state_dict(self, state_dict):
+        self.mlp.update_state_dict(state_dict)
+
     def forward(
         self,
         forward_meta: ForwardMeta,
         hidden_states: paddle.Tensor,
         residual: paddle.Tensor = None,
     ):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = self.input_layernorm(
+            hidden_states, residual_input=residual, forward_meta=forward_meta
+        )
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             forward_meta=forward_meta,
         )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states,
+            residual,
+        )
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states=hidden_states,
+            forward_meta=forward_meta,
+        )
 
         return hidden_states, residual
 
@@ -326,6 +394,15 @@ class Ernie4_5_Model(nn.Layer):
 
         self.num_layers = fd_config.model_config.num_hidden_layers
         fd_config.model_config.pretrained_config.prefix_name = "ernie"
+        self.fd_config = fd_config
+        self.redundant_table_manger = None
+        if fd_config.eplb_config.enable_eplb is True:
+            self.redundant_table_manger = RedundantExpertManger(
+                n_routed_experts=fd_config.model_config.moe_num_experts,
+                num_hidden_layers=fd_config.model_config.num_hidden_layers,
+                redundant_experts_num=fd_config.eplb_config.redundant_experts_num,
+                ep_size=fd_config.parallel_config.expert_parallel_size,
+            )
 
         self.embed_tokens = VocabParallelEmbedding(
             fd_config=fd_config,
@@ -339,6 +416,7 @@ class Ernie4_5_Model(nn.Layer):
             [
                 Ernie4_5_DecoderLayer(
                     fd_config=fd_config,
+                    redundant_table_manger=self.redundant_table_manger,
                     prefix=f"{fd_config.model_config.pretrained_config.prefix_name}.layers.{i}",
                 )
                 for i in range(self.num_layers)
@@ -367,24 +445,53 @@ class Ernie4_5_Model(nn.Layer):
             logger.info(f"Start load layer {i}")
             self.layers[i].load_state_dict(state_dict)
 
+    def update_state_dict(self, state_dict):
+        """
+        Update model parameters from a given state dictionary.
+
+        Args:
+            state_dict (dict[str, np.ndarray | paddle.Tensor]):
+                A dictionary containing model parameters, where keys are parameter names
+                and values are NumPy arrays or PaddlePaddle tensors.
+        """
+        for i in range(
+            self.fd_config.model_config.moe_layer_start_index,
+            self.fd_config.model_config.num_hidden_layers,
+        ):
+            logger.info(f"Start update layer {i}")
+            self.layers[i].update_state_dict(state_dict)
+
     def forward(
         self,
         ids_remove_padding: paddle.Tensor,
         forward_meta: ForwardMeta,
     ):
-        hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
+        hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
+
+        if current_platform.is_iluvatar() and forward_meta.attn_backend.mixed:
+            hidden_states = forward_meta.attn_backend.transpose(hidden_states)
 
         residual = None
         for i in range(self.num_layers):
             hidden_states, residual = self.layers[i](forward_meta, hidden_states, residual)
 
-        hidden_states = hidden_states + residual
+        out = self.norm(hidden_states, residual, forward_meta=forward_meta)[0]
 
-        out = self.norm(hidden_states)
+        if self.norm.is_last_norm and self.norm.fd_config.parallel_config.use_sequence_parallel_moe:
+            out = self.norm.allgather(out, forward_meta.ids_remove_padding.shape[0])
+
+        if current_platform.is_iluvatar() and forward_meta.attn_backend.mixed:
+            out = forward_meta.attn_backend.reverse_transpose(out)
 
         return out
 
 
+@ModelRegistry.register_model_class(
+    architecture="Ernie4_5_MoeForCausalLM",
+    module_name="ernie4_5_moe",
+    category=ModelCategory.TEXT_GENERATION,
+    primary_use=ModelCategory.TEXT_GENERATION,
+)
 class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
     """
     Ernie4_5_MoeForCausalLM
@@ -425,10 +532,7 @@ class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
         """
         self.ernie.load_state_dict(state_dict)
         if self.tie_word_embeddings:
-            if hasattr(self.lm_head, "linear"):
-                self.lm_head.linear.weight.set_value(self.ernie.embed_tokens.embeddings.weight.transpose([1, 0]))
-            else:  # ep
-                self.lm_head.weight.set_value(self.ernie.embed_tokens.embeddings.weight.transpose([1, 0]))
+            self.lm_head.load_state_dict({self.lm_head.weight_key: self.ernie.embed_tokens.embeddings.weight})
         else:
             self.lm_head.load_state_dict(state_dict)
 
@@ -441,46 +545,78 @@ class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
             weights_iterator (Iterator): An iterator yielding (name, weight) pairs.
         """
 
-        from fastdeploy.model_executor.models.utils import default_weight_loader
+        from fastdeploy.model_executor.utils import (
+            default_weight_loader,
+            process_weights_after_loading,
+            rename_offline_ckpt_suffix_to_fd_suffix,
+        )
 
         general_params_mapping = [
             # (param_name, weight_name, expert_id, shard_id)
             ("embed_tokens.embeddings", "embed_tokens", None, None),
             ("lm_head.linear", "lm_head", None, None),
+            ("experts.gate_correction_bias", "moe_statics.e_score_correction_bias", None, None),
+            ("qkv_proj", "q_proj", None, "q"),
+            ("qkv_proj", "k_proj", None, "k"),
+            ("qkv_proj", "v_proj", None, "v"),
+            ("up_gate_proj", "gate_proj", None, "gate"),
+            ("up_gate_proj", "up_proj", None, "up"),
+            ("attn.cache_k_scale", "cachek_matmul.activation_scale", None, None),
+            ("attn.cache_v_scale", "cachev_matmul.activation_scale", None, None),
+            ("attn.cache_k_zp", "cachek_matmul.activation_zero_point", None, None),
+            ("attn.cache_v_zp", "cachev_matmul.activation_zero_point", None, None),
         ]
 
         expert_params_mapping = []
         if getattr(self.fd_config.model_config, "moe_num_experts", None) is not None:
+            if self.fd_config.parallel_config.expert_parallel_size > 1:
+                num_experts = self.fd_config.parallel_config.num_experts_per_rank
+                num_experts_start_offset = self.fd_config.parallel_config.num_experts_start_offset
+            else:
+                num_experts = self.fd_config.model_config.moe_num_experts
+                num_experts_start_offset = 0
+
             expert_params_mapping = FusedMoE.make_expert_params_mapping(
-                num_experts=self.fd_config.model_config.moe_num_experts,
+                num_experts=num_experts,
                 ckpt_down_proj_name="down_proj",
                 ckpt_gate_up_proj_name="up_gate_proj",
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_up_proj_name="up_proj",
                 param_gate_up_proj_name="experts.up_gate_proj_",
                 param_down_proj_name="experts.down_proj_",
+                num_experts_start_offset=num_experts_start_offset,
             )
-            expert_params_mapping.append(
-                ("experts.gate_correction_bias", "moe_statics.e_score_correction_bias", None, "gate_bias")
-            )
-            logger.info(f"expert params mapping:{expert_params_mapping}")
-        all_param_mapping = general_params_mapping + expert_params_mapping
-
+        all_param_mapping = [
+            (param, weight, exp, shard, False) for param, weight, exp, shard in general_params_mapping
+        ] + [(param, weight, exp, shard, True) for param, weight, exp, shard in expert_params_mapping]
+        checkpoint_to_fd_key_fn = rename_offline_ckpt_suffix_to_fd_suffix(
+            fd_config=self.fd_config, ckpt_weight_suffix="quant_weight", ckpt_scale_suffix="weight_scale"
+        )
         params_dict = dict(self.named_parameters())
-        expert_id = None
-        shard_id = None
+
+        process_weights_after_loading_fn = process_weights_after_loading(
+            dict(self.named_sublayers()), fd_config=self.fd_config
+        )
 
         for loaded_weight_name, loaded_weight in weights_iterator:
-            for param_name, weight_name, exp_id, shard_id in all_param_mapping:
-                if weight_name not in loaded_weight_name:
-                    continue
+            loaded_weight_name = loaded_weight_name.replace("model", "ernie")
+            for param_name, weight_name, exp_id, shard_id, is_moe in all_param_mapping:
+                loaded_weight_name = checkpoint_to_fd_key_fn(loaded_weight_name, is_moe)
                 model_param_name = loaded_weight_name.replace(weight_name, param_name)
+                if model_param_name not in params_dict:
+                    continue
                 param = params_dict[model_param_name]
                 expert_id = exp_id
                 shard_id = shard_id
                 break
             else:
-                if loaded_weight_name not in params_dict.keys():
+                expert_id = None
+                shard_id = None
+                loaded_weight_name = checkpoint_to_fd_key_fn(loaded_weight_name, is_moe=False)
+                model_param_name = loaded_weight_name
+                if model_param_name not in params_dict.keys():
                     continue
-                param = params_dict[loaded_weight_name]
+                param = params_dict[model_param_name]
 
             # Get weight loader from parameter and set weight
             weight_loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
@@ -488,19 +624,25 @@ class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
             if "expert_id" in sig.parameters:
                 weight_loader(param, loaded_weight, expert_id=expert_id, shard_id=shard_id)
             else:
-                weight_loader(param, loaded_weight)
+                weight_loader(param, loaded_weight, shard_id)
 
-        if self.tie_word_embeddings:
-            self.lm_head.linear.weight.set_value(self.ernie.embed_tokens.embeddings.weight.transpose([1, 0]))
+            model_sublayer_name = re.sub(
+                r"\.(up_gate_proj_weight|down_proj_weight|weight|cache_k_scale|cache_v_scale)$", "", model_param_name
+            )
+            process_weights_after_loading_fn(model_sublayer_name, param)
+        if getattr(self, "tie_word_embeddings", False):
+            self.lm_head.linear.weight.set_value(
+                self.ernie.embed_tokens.embeddings.weight.transpose([1, 0]).astype(self.lm_head.linear.weight.dtype)
+            )
 
     def compute_logits(self, hidden_states: paddle.Tensor):
         logits = self.lm_head(hidden_states)
-        logits = paddle.cast(logits, paddle.float32)
+        logits = logits.astype(paddle.float32)
         logits[:, self.ori_vocab_size :] = -float("inf")
 
         return logits
 
-    def empty_input_forward(self):
+    def empty_input_forward(self, forward_meta):
         """
         empty_input_forward
         """
@@ -512,7 +654,7 @@ class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
             self.fd_config.model_config.moe_layer_start_index,
             self.fd_config.model_config.num_hidden_layers,
         ):
-            self.ernie.layers[i].mlp.experts(fake_hidden_states, self.ernie.layers[i].mlp.gate)
+            self.ernie.layers[i].mlp.experts(fake_hidden_states, self.ernie.layers[i].mlp.gate, forward_meta)
 
     def forward(
         self,
@@ -523,7 +665,17 @@ class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
 
         return hidden_states
 
+    def clear_grpah_opt_backend(self):
+        """Clear graph optimization backend, the captured cuda graph will be cleaned"""
+        self.ernie.clear_grpah_opt_backend(fd_config=self.fd_config)
 
+
+@ModelRegistry.register_model_class(
+    architecture="Ernie4_5_ForCausalLM",
+    module_name="ernie4_5_moe",
+    category=ModelCategory.TEXT_GENERATION,
+    primary_use=ModelCategory.TEXT_GENERATION,
+)
 class Ernie4_5_ForCausalLM(Ernie4_5_MoeForCausalLM):
     """
     Ernie4_5_ForCausalLM
@@ -535,6 +687,25 @@ class Ernie4_5_ForCausalLM(Ernie4_5_MoeForCausalLM):
         Model Architecture Name
         """
         return "Ernie4_5_ForCausalLM"
+
+
+@ModelRegistry.register_model_class(
+    architecture="Ernie4_5ForCausalLM",
+    module_name="ernie4_5_moe",
+    category=ModelCategory.TEXT_GENERATION,
+    primary_use=ModelCategory.TEXT_GENERATION,
+)
+class Ernie4_5ForCausalLM(Ernie4_5_ForCausalLM):
+    """
+    Ernie4_5ForCausalLM 0.3B-PT
+    """
+
+    @classmethod
+    def name(self):
+        """
+        Model Architecture Name
+        """
+        return "Ernie4_5ForCausalLM"
 
 
 class Ernie4_5_MoePretrainedModel(PretrainedModel):
@@ -612,6 +783,11 @@ class Ernie4_5_MoePretrainedModel(PretrainedModel):
             tsm.PairFused,
         ),
         WeightMeta(
+            f".layers.{{{layerid.MOE_LAYER_ID}}}.mlp.experts.{{{layerid.EXPERT_ID}}}.up_gate_proj.weight_scale",
+            True,
+            tsm.PairFused,
+        ),
+        WeightMeta(
             f".layers.{{{layerid.MOE_LAYER_ID}}}.mlp.experts.{{{layerid.EXPERT_ID}}}.down_proj.quant_weight",
             False,
         ),
@@ -631,7 +807,7 @@ class Ernie4_5_MoePretrainedModel(PretrainedModel):
         """
         get_tensor_parallel_mappings
         """
-        logger.info("erine inference model _get_tensor_parallel_mappings")
+        logger.info("ernie inference model _get_tensor_parallel_mappings")
         from fastdeploy.model_executor.models.tp_utils import (
             build_expanded_keys,
             has_prefix,
@@ -640,7 +816,7 @@ class Ernie4_5_MoePretrainedModel(PretrainedModel):
 
         fn = split_or_merge_func_v1(
             is_split=is_split,
-            tensor_parallel_degree=config.tensor_parallel_degree,
+            tensor_model_parallel_size=config.tensor_model_parallel_size,
             tensor_parallel_rank=config.tensor_parallel_rank,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
@@ -688,3 +864,16 @@ class Ernie4_5_PretrainedModel(Ernie4_5_MoePretrainedModel):
         Model Architecture Name
         """
         return "Ernie4_5_ForCausalLM"
+
+
+class Ernie4_5PretrainedModel(Ernie4_5_PretrainedModel):
+    """
+    Ernie4_5PretrainedModel 0.3B-PT
+    """
+
+    @classmethod
+    def arch_name(self):
+        """
+        Model Architecture Name
+        """
+        return "Ernie4_5ForCausalLM"

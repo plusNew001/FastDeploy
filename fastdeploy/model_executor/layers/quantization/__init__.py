@@ -16,6 +16,8 @@ quantization module
 """
 from typing import Dict, List, Type
 
+from fastdeploy.utils import parse_quantization
+
 from .quant_base import QuantConfigBase
 
 QUANTIZATION_METHODS: List[str] = [
@@ -32,6 +34,108 @@ QUANTIZATION_METHODS: List[str] = [
     "tensor_wise_fp8",
     "kvcache",
 ]
+
+
+def _compute_hadamard_block_size(moe_intermediate_size: int, tp_size: int) -> int:
+    if moe_intermediate_size % tp_size != 0:
+        raise ValueError(
+            f"moe_intermediate_size ({moe_intermediate_size}) must be divisible by " f"tp_size ({tp_size})"
+        )
+
+    shard_size = moe_intermediate_size // tp_size
+    block_size = shard_size & (-shard_size)
+    block_size = min(block_size, 512)
+
+    return block_size
+
+
+def parse_quant_config(args, model_config, is_ernie, is_v1_loader):
+    if args.quantization is not None and isinstance(args.quantization, str):
+        args.quantization = parse_quantization(args.quantization)
+    # 1.model_config.is_quantized
+    # TODO(bukejiyu)  model_config.is_quantized is v0 only need to be removed in future
+    if model_config.model_format == "torch":
+        quantization_config = model_config.quantization_config
+        if quantization_config is not None:
+            model_config.is_quantized = True
+    else:
+        quantization_config = model_config.quantization_config
+        if not model_config.is_quantized:
+            if quantization_config is not None:
+                if "is_quantized" in quantization_config:
+                    model_config.is_quantized = quantization_config["is_quantized"]
+                elif "is_moe_quantized" in quantization_config:
+                    model_config.is_moe_quantized = quantization_config["is_moe_quantized"]
+                elif "kv_cache_quant_type" not in quantization_config:
+                    model_config.is_quantized = True
+                    if "is_moe_quantized" not in quantization_config:
+                        model_config.is_quantized = True
+                    else:
+                        model_config.is_moe_quantized = True
+            if quantization_config is not None and quantization_config.get("quantization", None) is None:
+                raise ValueError(
+                    "quantization_config should have a key named 'quantization' for specify quant config."
+                )
+
+    quant_config_name = None
+
+    if quantization_config is not None:
+        quant_config_name = _get_offline_quant_config_name(
+            quantization_config, model_config.model_format == "torch", is_v1_loader
+        )
+    elif args.quantization is not None:
+        quantization_config = {}
+        try:
+            quantization_config.update(args.quantization)
+            quant_config_name = quantization_config["quantization"]
+        except:
+            quant_config_name = args.quantization["quantization"]
+            quantization_config["quantization"] = quant_config_name
+        # Special handling for Ernie models
+        if quant_config_name == "wint4" and is_ernie:
+            quantization_config["dense_quant_type"] = "wint8"
+            quantization_config["moe_quant_type"] = "wint4"
+            quantization_config["quantization"] = "mix_quant"
+            quant_config_name = "mix_quant"
+        # Special handling for moe w4afp8 dynamic quant
+        elif quant_config_name == "w4afp8":
+            quantization_config["dense_quant_type"] = "block_wise_fp8"
+            quantization_config["moe_quant_type"] = "w4afp8"
+            tp_size = getattr(args, "tensor_parallel_size", 1)
+            moe_intermediate_size = getattr(model_config, "moe_intermediate_size", None)
+            if moe_intermediate_size is not None:
+                hadamard_block_size = _compute_hadamard_block_size(moe_intermediate_size, tp_size)
+                quantization_config["hadamard_block_size"] = hadamard_block_size
+            else:
+                quantization_config["hadamard_block_size"] = 512
+            quantization_config["quantization"] = "mix_quant"
+            quant_config_name = "mix_quant"
+    else:
+        quant_config_name = None
+    if quant_config_name is None:
+        quant_config = None
+    else:
+        if not quantization_config.get("is_quantized"):
+            quantization_config["is_quantized"] = model_config.is_quantized
+        if args.dynamic_load_weight and quantization_config is not None:
+            quantization_config["is_quantized"] = True
+        quant_cls = get_quantization_config(quant_config_name)
+        quant_config = quant_cls.from_config(quantization_config)
+    return quant_config
+
+
+def _get_offline_quant_config_name(quantization_config, is_torch_weight, is_v1_loader):
+    if is_torch_weight:
+        # only support block_wise_fp8 now
+        quant_method = quantization_config.get("quant_method")
+        has_block_size = "weight_block_size" in quantization_config
+        if quant_method == "fp8" and has_block_size:
+            quant_config_name = "block_wise_fp8"
+        else:
+            raise ValueError("Torch weight offline quantization only supports block-wise FP8.")
+    else:
+        quant_config_name = quantization_config["quantization"]
+    return quant_config_name
 
 
 def get_quantization_config(quantization: str) -> Type[QuantConfigBase]:

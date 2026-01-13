@@ -49,11 +49,11 @@ class GcuWorker(WorkerBase):
     def init_device(self):
         """Initialize device and Construct model runner"""
         if paddle.is_compiled_with_custom_device("gcu"):
-            # Set evironment variable
+            # Set environment variable
             self.device_ids = self.parallel_config.device_ids.split(",")
             self.device = f"gcu:{self.local_rank}"
             paddle.device.set_device(self.device)
-            paddle.set_default_dtype(self.parallel_config.dtype)
+            paddle.set_default_dtype(self.model_config.dtype)
             logger.info(f"GcuWorker init_device:{self.device}, device_ids:{self.device_ids}")
 
             gc.collect()
@@ -127,7 +127,7 @@ class GcuWorker(WorkerBase):
         # NOTE(gongshaotian): may be not need warm_up at this place
         if self.model_runner.graph_opt_level >= 1:
             self.model_runner.sot_warmup()
-        # 2. Triger cuda grpah capture
+        # 2. Trigger cuda graph capture
         self.model_runner.capture_model()
         set_random_seed(self.fd_config.model_config.seed)
 

@@ -1,4 +1,3 @@
-"""
 # Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,17 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import paddle
-import paddle.nn.functional as F
 
 from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.forward_meta import ForwardMeta, ForwardMode
@@ -35,6 +31,9 @@ from fastdeploy.model_executor.layers.backends.metax.attention.flash_attention_i
     flash_attn_kvcache_func,
     flash_attn_unpadded_func,
 )
+from fastdeploy.model_executor.ops.gpu import cache_kv_with_rope
+from fastdeploy.model_executor.ops.gpu import merge_qkv as merge_qkv_cu
+from fastdeploy.model_executor.ops.gpu import split_qkv as split_qkv_cu
 
 
 @dataclass
@@ -54,12 +53,15 @@ class FlashAttentionMetadata(AttentionMetadata):
     decoder_batch_ids: paddle.Tensor = None
     decoder_tile_ids_per_batch: paddle.Tensor = None
     decoder_num_blocks: paddle.Tensor = None
+    cu_seqlens_q_decode: paddle.Tensor = None
+    batch_ids_per_token_decode: paddle.Tensor = None
+    seq_lens_decode: paddle.Tensor = None
+    block_table_decode: paddle.Tensor = None
 
     _dtype: paddle.dtype = paddle.bfloat16
     encoder_max_partition_size: int = 32768
     max_partition_size: int = 32768
     block_tables: Optional[paddle.Tensor] = None
-    rotary_embs: Optional[paddle.Tensor] = None
     attn_mask: Optional[paddle.Tensor] = None
     encoder_block_shape_q: int = -1
     decoder_block_shape_q: int = -1
@@ -91,9 +93,10 @@ class FlashAttentionBackend(AttentionBackend):
         FlashAttentionBackend __init__
         """
         super().__init__()
-        self.attention_metadata: FlashAttentionMetadata = None
-        self.block_size: int = fd_config.parallel_config.block_size
-        self.max_seq_len: int = fd_config.parallel_config.max_model_len
+        self.attention_metadata: FlashAttentionMetadata = FlashAttentionMetadata()
+        self.record_block_table_metadata = {}
+        self.block_size: int = fd_config.cache_config.block_size
+        self.max_seq_len: int = fd_config.model_config.max_model_len
         self.rope_theta: float = (
             10000.0 if fd_config.model_config.rope_theta is None else fd_config.model_config.rope_theta
         )
@@ -110,6 +113,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_num_heads: int = kv_num_heads
         self.num_heads: int = num_heads
         self.head_dim: int = fd_config.model_config.head_dim
+        self.total_num_heads = self.num_heads + 2 * self.kv_num_heads
+        self.total_hidden_dim = self.total_num_heads * self.head_dim
+        self.dtype = paddle.get_default_dtype()
         self.num_layers: int = fd_config.model_config.num_hidden_layers
         self.max_partition_size: int = int(os.getenv("FLAGS_max_partition_size", 32768))
 
@@ -121,11 +127,118 @@ class FlashAttentionBackend(AttentionBackend):
             fd_config.parallel_config.expert_parallel_rank = 0
 
         self.rank, self.device_id = init_rank_and_device_id(fd_config)
+        self.enable_mm = fd_config.model_config.enable_mm
+        self.model_type = fd_config.model_config.model_type
+        self.is_neox_style = False
+        if "paddleocr" in fd_config.model_config.model_type:
+            self.is_neox_style = True
+
+        max_num_seqs = fd_config.scheduler_config.max_num_seqs
+        self.attention_metadata.decoder_batch_ids = paddle.empty(shape=[max_num_seqs], dtype="int32")
+        self.attention_metadata.cu_seqlens_q_decode = paddle.empty(shape=[max_num_seqs + 1], dtype="int32")
+        self.attention_metadata.batch_ids_per_token_decode = paddle.empty(shape=[max_num_seqs], dtype="int32")
+        self.attention_metadata.seq_lens_decode = paddle.empty(shape=[max_num_seqs, 1], dtype="int32")
+        self.attention_metadata.block_table_decode = paddle.empty(
+            shape=[
+                max_num_seqs,
+                self.max_seq_len // self.block_size + fd_config.cache_config.enc_dec_block_num,
+            ],
+            dtype="int32",
+        )
 
     def init_attention_metadata(self, forward_meta: ForwardMeta):
         """Initialize attntion metadata hence all layers in the forward pass can reuse it."""
         forward_meta.forward_mode = ForwardMode.NATIVE
-        return
+        self.prefill_info_dict = {}
+        self.decode_info_dict = {}
+
+        prefill_non_zeros_ids = forward_meta.seq_lens_this_time > 1
+        decode_non_zeros_ids = forward_meta.seq_lens_this_time == 1
+        self.prefill_info_dict["batch_ids"] = paddle.where(prefill_non_zeros_ids)[0].astype("int32")
+        self.decode_info_dict["batch_ids"] = paddle.where(decode_non_zeros_ids)[0].astype("int32")
+
+        self.prefill_len = len(self.prefill_info_dict["batch_ids"])
+        self.decode_len = len(self.decode_info_dict["batch_ids"])
+        self.has_prefill = self.prefill_len > 0
+        self.has_decode = self.decode_len > 0
+
+        if self.has_prefill:
+            batch_ids_prefill = self.prefill_info_dict["batch_ids"]
+
+            seq_lens_this_time_prefill = forward_meta.seq_lens_this_time[batch_ids_prefill, 0]
+            self.prefill_info_dict["cu_seqlens_q"] = paddle.concat(
+                [paddle.zeros([1], dtype="int32"), paddle.cumsum(seq_lens_this_time_prefill, axis=0).astype("int32")],
+                axis=0,
+            )
+            self.prefill_info_dict["seq_lens_prefill"] = paddle.zeros(self.prefill_len, dtype="int32")
+
+            local_ids = paddle.arange(self.prefill_len, dtype="int32")
+            self.prefill_info_dict["batch_ids_per_token"] = paddle.repeat_interleave(
+                local_ids, repeats=seq_lens_this_time_prefill, axis=0
+            )
+
+        if self.has_decode:
+            batch_ids_decode = self.decode_info_dict["batch_ids"]
+
+            seq_lens_this_time_decode = forward_meta.seq_lens_this_time[batch_ids_decode, 0]
+            cu_seqlens_q_decode = paddle.concat(
+                [paddle.zeros([1], dtype="int32"), paddle.cumsum(seq_lens_this_time_decode, axis=0).astype("int32")],
+                axis=0,
+            )
+
+            local_ids = paddle.arange(self.decode_len, dtype="int32")
+            batch_ids_per_token_decode = paddle.repeat_interleave(local_ids, repeats=seq_lens_this_time_decode, axis=0)
+
+            self.attention_metadata.decoder_batch_ids[: self.decode_len].copy_(batch_ids_decode)  # global batch id
+            self.attention_metadata.cu_seqlens_q_decode[: self.decode_len + 1].copy_(cu_seqlens_q_decode)
+            self.attention_metadata.batch_ids_per_token_decode[: self.decode_len].copy_(batch_ids_per_token_decode)
+            self.attention_metadata.seq_lens_decode[: self.decode_len].copy_(
+                forward_meta.seq_lens_decoder[batch_ids_decode, 0]
+            )
+            self.attention_metadata.block_table_decode[: self.decode_len].copy_(
+                forward_meta.block_tables[batch_ids_decode, :]
+            )
+
+        if self.has_prefill and self.has_decode:
+            non_zeros_mask = forward_meta.seq_lens_this_time != 0
+            seq_lens_non_zeros = forward_meta.seq_lens_this_time[non_zeros_mask].astype("int32")
+
+            global_sequence_offsets = paddle.zeros(seq_lens_non_zeros.shape[0] + 1, dtype="int32")
+            global_sequence_offsets[1:] = paddle.cumsum(seq_lens_non_zeros)
+
+            is_prefill_array = seq_lens_non_zeros > 1
+
+            group_boundary = paddle.where(is_prefill_array[1:] != is_prefill_array[:-1])[0].astype("int32") + 1
+            group_starts = paddle.concat((paddle.zeros([1], dtype="int32"), group_boundary))
+            group_ends = paddle.concat(
+                (group_boundary, paddle.full([1], fill_value=seq_lens_non_zeros.shape[0], dtype="int32"))
+            )
+
+            compact_meta = []
+            prefill_ptr = 0
+            decode_ptr = 0
+
+            for start, end in zip(group_starts, group_ends):
+                is_prefill = is_prefill_array[start]
+                g_start = global_sequence_offsets[start]
+                g_end = global_sequence_offsets[end]
+                num_tokens = g_end - g_start
+
+                if is_prefill:
+                    # [0, prefill_start, prefill_end, global_start, global_end]
+                    compact_meta.append([0, prefill_ptr, prefill_ptr + num_tokens, g_start, g_end])
+                    prefill_ptr += num_tokens
+                else:
+                    # [1, decode_start, decode_end, global_start, global_end]
+                    compact_meta.append([1, decode_ptr, decode_ptr + num_tokens, g_start, g_end])
+                    decode_ptr += num_tokens
+
+            self.hybrid_stage_meta = paddle.to_tensor(compact_meta, dtype="int32")
+            self.prefill_qkv = paddle.zeros([prefill_ptr, self.total_hidden_dim], dtype=self.dtype)
+            self.decode_qkv = paddle.zeros([decode_ptr, self.total_hidden_dim], dtype=self.dtype)
+            self.merged_output = paddle.zeros(
+                [prefill_ptr + decode_ptr, self.num_heads, self.head_dim], dtype=self.dtype
+            )
 
     def get_attntion_meta(self) -> AttentionMetadata:
         """get_attntion_meta"""
@@ -137,257 +250,127 @@ class FlashAttentionBackend(AttentionBackend):
         kv_cache_quant_type: str = None,
     ):
         """
-        Caculate kv cache shape
+        Calculate kv cache shape
         """
+        key_cache_shape = value_cache_shape = [max_num_blocks, self.block_size, self.kv_num_heads, self.head_dim]
+
         if kv_cache_quant_type is not None and kv_cache_quant_type == "int4_zp":
-            return (
+            key_cache_shape = value_cache_shape = [
                 max_num_blocks,
                 self.kv_num_heads,
                 self.block_size,
                 self.head_dim // 2,
-            )
-        else:
-            return (
-                max_num_blocks,
-                self.kv_num_heads,
-                self.block_size,
-                self.head_dim,
-            )
+            ]
 
-    def split_qkv(self, qkv, num_head_q, num_head_kv, dim):
-        q = qkv[:, : num_head_q * dim].reshape([-1, num_head_q, dim])
-        k = qkv[:, num_head_q * dim : num_head_q * dim + num_head_kv * dim].reshape([-1, num_head_kv, dim])
-        v = qkv[:, num_head_q * dim + num_head_kv * dim :].reshape([-1, num_head_kv, dim])
-        return q, k, v
+        return key_cache_shape, value_cache_shape
 
-    def flash_attn_varlen(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
-        num_head = q.shape[1]
-        dim = q.shape[2]
+    def split_pd_qkv(self, qkv):
+        split_qkv_cu(qkv, self.hybrid_stage_meta, self.prefill_qkv, self.decode_qkv)
 
-        q_ = q.reshape([-1, num_head, dim])
-        k_ = k.reshape([-1, num_head, dim])
-        v_ = v.reshape([-1, num_head, dim])
+    def merge_pd_output(self, prefill_out, decode_out):
+        merge_qkv_cu(prefill_out, decode_out, self.hybrid_stage_meta, self.merged_output)
 
-        bsz = cu_seqlens_q.shape[0] - 1
-        out = []
-        for i in range(bsz):
-            start_q, end_q = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
-            start_k, end_k = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
-            qi = q_[start_q:end_q]  # [seq_q, nh, dim]
-            ki = k_[start_k:end_k]  # [seq_k, nh, dim]
-            vi = v_[start_k:end_k]  # [seq_k, nh, dim]
-            qi = qi.transpose([1, 0, 2])  # [nh, seq_q, dim]
-            ki = ki.transpose([1, 2, 0])  # [nh, dim, seq_k]
-            vi = vi.transpose([1, 0, 2])  # [nh, seq_k, dim]
-
-            score = paddle.matmul(qi, ki) / math.sqrt(dim)  # [nh, seq_q, seq_k]
-            prob = F.softmax(score, axis=-1)
-            o = paddle.matmul(prob, vi)  # [nh, seq_q, dim]
-            o = o.transpose([1, 0, 2])  # [seq_q, nh, dim]
-            out.append(o)
-
-        return paddle.concat(out, axis=0)  # [total_q, nh, dim]
-
-    def flash_attn_with_kvcache(self, q, cache_k, cache_v, cache_seqlens, block_tables=None):
-        bs, _, nh, dim = q.shape
-        out = []
-        for i in range(bs):
-            q_i = q[i]  # [1, nh, dim]
-            k_i = cache_k[i, : cache_seqlens[i, 0]]  # [seqlen, nh, dim]
-            v_i = cache_v[i, : cache_seqlens[i, 0]]
-            qi = q_i.transpose([1, 0, 2])  # [nh, 1, dim]
-            ki = k_i.transpose([1, 2, 0])  # [nh, dim, seqlen]
-            vi = v_i.transpose([1, 0, 2])  # [nh, seqlen, dim]
-            score = paddle.matmul(qi, ki) / math.sqrt(dim)
-            prob = F.softmax(score, axis=-1)
-            o = paddle.matmul(prob, vi).transpose([1, 0, 2])  # [1, nh, dim]
-            out.append(o)
-        return paddle.concat(out, axis=0)  # [bs, nh, dim]
-
-    def block_cache_to_naive_cache(slef, cache_k, cache_v, bsz, block_tables, cache_seq_len):
-        _, num_head, blocksize, dim_head = cache_k.shape
-        out_cache_k = paddle.zeros(shape=[bsz, num_head, cache_seq_len, dim_head], dtype=cache_k.dtype)
-        out_cache_v = paddle.zeros(shape=[bsz, num_head, cache_seq_len, dim_head], dtype=cache_v.dtype)
-        for i in range(bsz):
-            for j in range(cache_seq_len):
-                out_cache_k[i, :, j, :] = cache_k[block_tables[i, j // blocksize], :, j % blocksize, :]
-                out_cache_v[i, :, j, :] = cache_v[block_tables[i, j // blocksize], :, j % blocksize, :]
-        return out_cache_k, out_cache_v
-
-    def block_cache_to_naive_cache__(self, cache_k, cache_v, bsz, block_tables, max_cache_seq_len):
-        _, num_head, blocksize, dim_head = cache_k.shape
-        out_cache_k = paddle.zeros(shape=[bsz, max_cache_seq_len + 1, num_head, dim_head], dtype=cache_k.dtype)
-        out_cache_v = paddle.zeros(shape=[bsz, max_cache_seq_len + 1, num_head, dim_head], dtype=cache_v.dtype)
-        for i in range(bsz):
-            for j in range(max_cache_seq_len):
-                out_cache_k[i, j, :, :] = cache_k[block_tables[i, j // blocksize], :, j % blocksize, :]
-                out_cache_v[i, j, :, :] = cache_v[block_tables[i, j // blocksize], :, j % blocksize, :]
-        return out_cache_k, out_cache_v
-
-    def update_encoder_kv_cache(self, k, v, seq_lens_encoder, cache_k, cache_v, block_tables):
-        _, num_head, blocksize, dim_head = cache_k.shape
-        offset = 0
-        for batch_idx, seq_len in enumerate(seq_lens_encoder.numpy()):
-            if seq_len == 0:
-                continue
-            for seq_idx in range(seq_len):
-                block_id = block_tables[batch_idx, seq_idx // blocksize]
-                assert block_id != -1
-                index = offset + seq_idx
-                cache_k[block_id, :, seq_idx % blocksize, :] = k[index, :, :]
-                cache_v[block_id, :, seq_idx % blocksize, :] = v[index, :, :]
-
-            offset += seq_len
-
-    def update_decoder_kv_cache(self, k, v, seq_lens_decoder, cache_k, cache_v, block_tables):
-        _, num_head, blocksize, dim_head = cache_k.shape
-        for batch_idx, seq_idx in enumerate(seq_lens_decoder.numpy()):
-            if seq_idx == 0:
-                continue
-            block_id = block_tables[batch_idx, seq_idx // blocksize]
-            assert block_id != -1
-            cache_k[block_id, :, seq_idx % blocksize, :] = k[batch_idx, :, :]
-            cache_v[block_id, :, seq_idx % blocksize, :] = v[batch_idx, :, :]
-
-    def apply_rope(self, qk, cos, sin):
-        rotate_half = paddle.reshape(
-            paddle.stack([-qk[..., 1::2], qk[..., 0::2]], axis=-1),
-            paddle.shape(qk),
+    def apply_rope_prefill(self, qkv, rotary_embs, caches_k, caches_v, block_tables):
+        return cache_kv_with_rope(
+            qkv,
+            rotary_embs,
+            self.prefill_info_dict["batch_ids_per_token"],
+            self.prefill_info_dict["batch_ids"],
+            self.prefill_info_dict["cu_seqlens_q"],
+            self.prefill_info_dict["seq_lens_prefill"],
+            caches_k,
+            caches_v,
+            block_tables,
+            self.num_heads,
+            self.kv_num_heads,
+            self.head_dim,
+            self.block_size,
+            out_dims=3,
+            neox_style=self.is_neox_style,  # is neox style
         )
-        out = paddle.add(paddle.multiply(qk, cos), paddle.multiply(rotate_half, sin))
-        return paddle.cast(out, qk.dtype)
 
-    def forward_native_backend(
-        self,
-        q: paddle.Tensor,
-        k: paddle.Tensor,
-        v: paddle.Tensor,
-        qkv: paddle.Tensor,
-        layer,
-        forward_meta: ForwardMeta,
-    ):
+    def apply_rope_decode(self, qkv, rotary_embs):
+        return cache_kv_with_rope(
+            qkv,
+            rotary_embs,
+            self.attention_metadata.batch_ids_per_token_decode,
+            self.attention_metadata.decoder_batch_ids,
+            self.attention_metadata.cu_seqlens_q_decode,
+            self.attention_metadata.seq_lens_decode,
+            None,
+            None,
+            None,
+            self.num_heads,
+            self.kv_num_heads,
+            self.head_dim,
+            -1,
+            out_dims=4,
+            neox_style=self.is_neox_style,  # is neox style
+        )
 
-        bsz = forward_meta.seq_lens_this_time.shape[0]
-        num_head_q, num_head_kv, dim = layer.num_heads, layer.kv_num_heads, layer.head_dim
+    def forward_prefill(self, prefill_qkv, layer_id, k_cache_id, v_cache_id, forward_meta: ForwardMeta):
+        q, k, v = self.apply_rope_prefill(
+            prefill_qkv,
+            forward_meta.rotary_embs,
+            forward_meta.caches[k_cache_id],
+            forward_meta.caches[v_cache_id],
+            forward_meta.block_tables,
+        )
 
-        # 1. 分离 encoder / decoder 的 mask
-        seq_lens_encoder = forward_meta.seq_lens_encoder.squeeze(-1)
-        seq_lens_decoder = forward_meta.seq_lens_decoder.squeeze(-1)
-        seq_lens_this_time = forward_meta.seq_lens_this_time.squeeze(-1)
-        encoder_indices = []
-        decoder_indices = []
+        prefill_out = flash_attn_unpadded_func(
+            q,
+            k,
+            v,
+            self.prefill_info_dict["cu_seqlens_q"],
+            self.prefill_info_dict["cu_seqlens_q"],
+            max_seqlen_q=self.max_seq_len,
+            max_seqlen_k=self.max_seq_len,
+            attn_mask=forward_meta.attn_mask,
+            causal=self.causal,
+        )[0]
 
-        offset = 0
-        for i in range(bsz):
-            length = seq_lens_this_time[i].item()
-            if seq_lens_encoder[i] > 0:
-                encoder_indices.extend(range(offset, offset + length))
-            elif seq_lens_decoder[i] > 0:
-                decoder_indices.extend(range(offset, offset + length))
-            offset += length
+        return prefill_out
 
-        encoder_indices = paddle.to_tensor(encoder_indices, dtype="int32")
-        decoder_indices = paddle.to_tensor(decoder_indices, dtype="int32")
+    def forward_decode(self, decode_qkv, k_cache_id, v_cache_id, forward_meta: ForwardMeta):
+        q, k, v = self.apply_rope_decode(decode_qkv, forward_meta.rotary_embs)
 
-        encoder_qkv = paddle.index_select(qkv, encoder_indices, axis=0)
-        decoder_qkv = paddle.index_select(qkv, decoder_indices, axis=0)
+        decode_out = flash_attn_kvcache_func(
+            q,
+            forward_meta.caches[k_cache_id],
+            forward_meta.caches[v_cache_id],
+            self.attention_metadata.seq_lens_decode,
+            self.attention_metadata.block_table_decode,
+            k,
+            v,
+            rotary_cos=None,
+            rotary_sin=None,
+            causal=self.causal,
+            is_rotary_interleaved=True,
+        )[0].squeeze(1)
 
-        # 2. 分解 encoder 和 decoder 的 qkv
-        encoder_q, encoder_k, encoder_v = self.split_qkv(encoder_qkv, num_head_q, num_head_kv, dim)
-        decoder_q, decoder_k, decoder_v = self.split_qkv(decoder_qkv, num_head_q, num_head_kv, dim)
-        cache_k = forward_meta.caches[2 * layer.layer_id]
-        cache_v = forward_meta.caches[2 * layer.layer_id + 1]
+        return decode_out
 
-        # 3. Rotary Embedding
-        if decoder_q.numel() != 0 or encoder_q.numel() != 0:
-            for batch_idx in range(forward_meta.seq_lens_this_time.shape[0]):
-                seq_len_i = forward_meta.seq_lens_this_time[batch_idx]
-                if seq_len_i == 0:
-                    continue
-                cached_kv_len = seq_lens_decoder[batch_idx]
-                cu_seq_start_q = forward_meta.cu_seqlens_q[batch_idx]
-                cu_seq_end_q = forward_meta.cu_seqlens_q[batch_idx + 1]
-                if forward_meta.rotary_embs is not None and cu_seq_end_q > cu_seq_start_q:
-                    cos = forward_meta.rotary_embs[0, 0, cached_kv_len : cached_kv_len + seq_len_i, :, :]
-                    sin = forward_meta.rotary_embs[1, 0, cached_kv_len : cached_kv_len + seq_len_i, :, :]
+    @paddle.no_grad()
+    def forward_native_backend(self, q, k, v, qkv, layer, forward_meta: ForwardMeta):
 
-                    def rope_func(qk):
-                        qk[cu_seq_start_q:cu_seq_end_q] = self.apply_rope(qk[cu_seq_start_q:cu_seq_end_q], cos, sin)
+        layer_id = layer.layer_id
+        k_cache_id = layer_id * 2
+        v_cache_id = k_cache_id + 1
 
-                    if encoder_q.numel() != 0:
-                        rope_func(encoder_q)
-                        rope_func(encoder_k)
-                    if decoder_q.numel() != 0:
-                        rope_func(decoder_q)
-                        rope_func(decoder_k)
+        if self.has_prefill and not self.has_decode:
+            out = self.forward_prefill(qkv, layer_id, k_cache_id, v_cache_id, forward_meta)
 
-        # 4. Flash Attention for encoder
-        encoder_v = encoder_v
-        cu_seqlens_q = forward_meta.cu_seqlens_q
-        cu_seqlens_k = forward_meta.cu_seqlens_k
-        max_seqlen_q = paddle.max(seq_lens_this_time)
-        max_seqlen_k = max_seqlen_q
+        elif self.has_decode and not self.has_prefill:
+            out = self.forward_decode(qkv, k_cache_id, v_cache_id, forward_meta)
 
-        if encoder_q.numel() > 0:
-            encoder_out = flash_attn_unpadded_func(
-                encoder_q,
-                encoder_k,
-                encoder_v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                attn_mask=forward_meta.attn_mask,
-                causal=self.causal,
-            )
-            self.update_encoder_kv_cache(
-                encoder_k, encoder_v, seq_lens_encoder, cache_k, cache_v, forward_meta.block_tables
-            )
         else:
-            encoder_out = None
+            self.split_pd_qkv(qkv)
+            prefill_output = self.forward_prefill(self.prefill_qkv, layer_id, k_cache_id, v_cache_id, forward_meta)
+            decode_output = self.forward_decode(self.decode_qkv, k_cache_id, v_cache_id, forward_meta)
+            self.merge_pd_output(prefill_output, decode_output)
+            out = self.merged_output
 
-        # 5. decoder attention with kv cache
-        bs = decoder_q.shape[0]
-        decoder_q = decoder_q.reshape([bs, 1, num_head_q, dim])
-        decoder_k_ = decoder_k.reshape([bs, 1, num_head_kv, dim])
-        decoder_v_ = decoder_v.reshape([bs, 1, num_head_kv, dim])
-        cache_seqlens = paddle.index_select(forward_meta.seq_lens_decoder, decoder_indices, axis=0)
-
-        # 5.1 convert paged kv cache to continuous cache
-        if decoder_q.numel() > 0:
-            max_cache_seq_len = paddle.max(cache_seqlens)
-            c_cache_k, c_cache_v = self.block_cache_to_naive_cache__(
-                cache_k, cache_v, bs, forward_meta.block_tables, max_cache_seq_len
-            )
-            decoder_out = flash_attn_kvcache_func(
-                decoder_q,
-                c_cache_k,
-                c_cache_v,
-                cache_seqlens.squeeze(-1),
-                None,
-                decoder_k_,
-                decoder_v_,
-                causal=self.causal,
-            )
-            self.update_decoder_kv_cache(
-                decoder_k, decoder_v, seq_lens_decoder, cache_k, cache_v, forward_meta.block_tables
-            )
-        else:
-            decoder_out = None
-
-        # 6. 拼接 encoder_out 和 decoder_out
-        total_len = qkv.shape[0]
-        out = paddle.zeros([total_len, num_head_q, dim])
-        if encoder_out is not None:
-            out = paddle.tensor.put_along_axis(
-                out, encoder_indices.unsqueeze(-1).unsqueeze(-1), encoder_out[0], axis=0
-            )
-        if decoder_out is not None:
-            new_decoder_out = decoder_out[0].squeeze(1)
-            out = paddle.tensor.put_along_axis(
-                out, decoder_indices.unsqueeze(-1).unsqueeze(-1), new_decoder_out, axis=0
-            )
-
-        out.reshape_([total_len, num_head_q * dim])
+        if qkv.dim() == 2:
+            out = out.view([-1, self.num_heads * self.head_dim])
 
         return out

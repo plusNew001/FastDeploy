@@ -28,6 +28,8 @@ else:
     from paddle.incubate.nn.functional import fused_layer_norm, fused_rms_norm
 
 from fastdeploy.config import FDConfig
+from fastdeploy.model_executor.forward_meta import ForwardMeta
+from fastdeploy.model_executor.ops.triton_ops import _TRITON_AVAILABLE, qk_rmsnorm_fused
 
 from .utils import get_tensor
 
@@ -46,6 +48,8 @@ class RMSNorm(nn.Layer):
         bias: paddle.Tensor = None,
         quant_scale: float = None,
         begin_norm_axis: int = 1,
+        dtype: str = None,
+        layer_id: int = -1,
     ) -> None:
         """
         Initializes the RMSNormalization layer.
@@ -80,12 +84,37 @@ class RMSNorm(nn.Layer):
             self.norm_func: Callable = fused_rms_norm
         self.bias: Optional[paddle.Tensor] = bias
         self.quant_scale: Optional[float] = quant_scale
-        self._dtype: str = self._helper.get_default_dtype()
-        self._norm_weight_dtype: str = self._dtype
+
+        self._norm_weight_dtype = dtype
+        if self._norm_weight_dtype is None:
+            self._norm_weight_dtype = self._helper.get_default_dtype()
+        else:
+            assert dtype in [
+                "float32",
+                "bfloat16",
+                "float16",
+            ], f"Unsupported dtype: {dtype}. Must be one of: float32, bfloat16, float16"
+
         self.quant_round_type: int = self.fd_config.quant_config.quant_round_type if fd_config.quant_config else 0
         self.quant_max_bound: int = self.fd_config.quant_config.quant_max_bound if fd_config.quant_config else 0
         self.quant_min_bound: int = self.fd_config.quant_config.quant_min_bound if fd_config.quant_config else 0
         self.begin_norm_axis: int = begin_norm_axis
+
+        self.layer_id = layer_id
+        self.ep_size = self.fd_config.parallel_config.expert_parallel_size
+        self.tp_size = self.fd_config.parallel_config.tensor_parallel_size
+        self.tp_rank = self.fd_config.parallel_config.tensor_parallel_rank
+        self.tp_group = self.fd_config.parallel_config.tp_group
+        is_input_norm = prefix.endswith(".input_layernorm")
+        self.is_last_norm = prefix.endswith(".norm")
+        self.split_x = (
+            self.fd_config.parallel_config.use_sequence_parallel_moe
+            and self.layer_id == self.fd_config.model_config.moe_layer_start_index
+            and is_input_norm
+        )
+        self.allgather_out = self.fd_config.parallel_config.use_sequence_parallel_moe and (
+            (self.layer_id > self.fd_config.model_config.moe_layer_start_index and is_input_norm)
+        )
 
         self.init_weight()
 
@@ -102,6 +131,10 @@ class RMSNorm(nn.Layer):
                 dtype=self._norm_weight_dtype,
             )
 
+    def weight_loader(self, param, loaded_weight, loaded_shard_id: Optional[str] = None):
+        loaded_weight = get_tensor(loaded_weight).astype(self._norm_weight_dtype)
+        param.copy_(loaded_weight, False)
+
     def load_state_dict(self, state_dict: Dict[str, paddle.Tensor | np.ndarray]):
         """
         Load the checkpoint state dictionary into the layer.
@@ -111,10 +144,56 @@ class RMSNorm(nn.Layer):
         """
 
         # weight
-        weight_tensor = paddle.cast(get_tensor(state_dict.pop(self.weight_key)), self._norm_weight_dtype)
-        self.weight.set_value(weight_tensor)
+        weight_tensor = get_tensor(state_dict.pop(self.weight_key))
+        self.weight.set_value(weight_tensor.astype(self._norm_weight_dtype))
 
-    def forward(self, x, residual_input: Optional[paddle.Tensor] = None) -> paddle.Tensor:
+    def split(self, x):
+        """
+        Split the input tensor across tensor parallel dimension.
+
+        Args:
+            x (paddle.Tensor): Input tensor to be split.
+
+        Returns:
+            paddle.Tensor: Splitted tensor.
+        """
+        token_num = x.shape[0]
+        token_num_per_rank = (token_num + self.tp_size - 1) // self.tp_size
+        # AllGather will hang when the data shapes on multi-ranks are different!
+        start_offset = self.tp_rank * token_num_per_rank
+        end_offset = (self.tp_rank + 1) * token_num_per_rank
+        if start_offset >= token_num:
+            start_offset = token_num
+        if end_offset > token_num:
+            end_offset = token_num
+        part_x = paddle.zeros(shape=[token_num_per_rank, x.shape[1]], dtype=x.dtype)
+        part_x[: (end_offset - start_offset), :] = x[start_offset:end_offset, :]
+        return part_x
+
+    def allgather(self, out, token_num):
+        """
+        Gather the output tensor from each tensor parallel rank.
+
+        Args:
+            out (paddle.Tensor): Output tensor to be gathered.
+
+        Returns:
+            paddle.Tensor: Gathered tensor.
+        """
+        token_num_per_rank = out.shape[0]
+        if token_num_per_rank == 0:
+            return out
+        multi_outs = paddle.zeros([token_num_per_rank * self.tp_size, out.shape[1]], dtype=out.dtype)
+        paddle.distributed.all_gather(multi_outs, out, self.tp_group)
+        return multi_outs[:token_num, :]
+
+    def forward(
+        self,
+        x,
+        residual_input: Optional[paddle.Tensor] = None,
+        forward_meta: Optional[ForwardMeta] = None,
+        external_rmsnorm: Optional[Callable] = None,
+    ) -> paddle.Tensor:
         """
         Defines the forward computation of the layer.
 
@@ -131,28 +210,136 @@ class RMSNorm(nn.Layer):
                   The `residual_output` is the result of applying the normalization and possibly other
                   operations (like linear transformation) on the `residual_input`.
         """
-        if current_platform.is_gcu():
-            if residual_input is None:
-                return rms_norm(x, self.weight, self.eps)
-            norm_out = self.norm_func(x, residual_input, self.weight, self.eps)
-        else:
-            norm_out = self.norm_func(
-                x,
-                norm_weight=self.weight,
-                norm_bias=None,
-                epsilon=self.eps,
-                begin_norm_axis=self.begin_norm_axis,
-                bias=self.bias,
-                residual=residual_input,
-                quant_scale=(-1 if self.quant_scale is None else self.quant_scale),
-                quant_round_type=self.quant_round_type,
-                quant_max_bound=self.quant_max_bound,
-                quant_min_bound=self.quant_min_bound,
-            )
+        x_dtype = x.dtype
+        x = x.astype(self.weight.dtype)
         if residual_input is not None:
-            return norm_out[0], norm_out[1]
+            residual_input_dtype = residual_input.dtype
+            residual_input = residual_input.astype(self.weight.dtype)
+
+        if residual_input is None:
+            residual_out = x
+        if external_rmsnorm is None:
+            if current_platform.is_gcu():
+                if residual_input is None:
+                    norm_out = rms_norm(x, self.weight, self.eps)
+                    return norm_out.astype(x_dtype), residual_out
+                norm_out = self.norm_func(x, residual_input, self.weight, self.eps)
+            else:
+                norm_out = self.norm_func(
+                    x,
+                    norm_weight=self.weight,
+                    norm_bias=None,
+                    epsilon=self.eps,
+                    begin_norm_axis=self.begin_norm_axis,
+                    bias=self.bias,
+                    residual=residual_input,
+                    quant_scale=(-1 if self.quant_scale is None else self.quant_scale),
+                    quant_round_type=self.quant_round_type,
+                    quant_max_bound=self.quant_max_bound,
+                    quant_min_bound=self.quant_min_bound,
+                )
         else:
-            return norm_out[0]
+            if residual_input is not None:
+                x = x + residual_input
+            norm_out = external_rmsnorm(x, self.weight, self.eps), x
+
+        out = norm_out[0].astype(x_dtype)
+        if residual_input is not None:
+            residual_out = norm_out[1].astype(residual_input_dtype)
+
+        if self.split_x:
+            assert residual_out is not None
+            residual_out = self.split(residual_out)
+        if self.allgather_out:
+            assert forward_meta is not None
+            out = self.allgather(out, forward_meta.ids_remove_padding.shape[0])
+
+        return out, residual_out
+
+
+class QKRMSNorm(nn.Layer):
+    """
+    QK Normalization layer.
+    """
+
+    def __init__(
+        self,
+        fd_config: FDConfig,
+        head_dim: int,
+        q_size: int,
+        kv_size: int,
+        eps: float = 1e-5,
+        prefix: str = "",
+        begin_norm_axis: int = 1,
+        dtype: str = None,
+    ) -> None:
+        super().__init__()
+        self.fd_config = fd_config
+        self.prefix: str = prefix
+        self.head_dim: int = head_dim
+        self.q_weight_key: Optional[str] = f"{prefix}.q_norm.weight"
+        self.k_weight_key: Optional[str] = f"{prefix}.k_norm.weight"
+        self.eps: float = eps
+        self._norm_weight_dtype = dtype
+        if self._norm_weight_dtype is None:
+            self._norm_weight_dtype = self._helper.get_default_dtype()
+        else:
+            assert dtype in [
+                "float32",
+                "bfloat16",
+                "float16",
+            ], f"Unsupported dtype: {dtype}. Must be one of: float32, bfloat16, float16"
+
+        self.q_size = q_size
+        self.kv_size = kv_size
+
+        self.q_norm = RMSNorm(
+            fd_config,
+            hidden_size=self.head_dim,
+            eps=fd_config.model_config.rms_norm_eps,
+            prefix=f"{prefix}.q_norm",
+            begin_norm_axis=begin_norm_axis,
+        )
+        self.k_norm = RMSNorm(
+            fd_config,
+            hidden_size=self.head_dim,
+            eps=fd_config.model_config.rms_norm_eps,
+            prefix=f"{prefix}.k_norm",
+            begin_norm_axis=begin_norm_axis,
+        )
+        self.qk_norm_fused = _TRITON_AVAILABLE
+
+    def load_state_dict(self, state_dict):
+        self.q_norm.load_state_dict(state_dict)
+        self.k_norm.load_state_dict(state_dict)
+
+    def forward(
+        self,
+        qkv_out,
+    ) -> paddle.Tensor:
+        if self.qk_norm_fused:
+            qkv_out = qk_rmsnorm_fused(
+                qkv_out,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.eps,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+            )
+        else:
+            q, k, v = qkv_out.split([self.q_size, self.kv_size, self.kv_size], axis=-1)
+
+            q_by_head = q.reshape([*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim])
+            q_by_head = self.q_norm(q_by_head)[0]
+            q = q_by_head.reshape(q.shape)
+
+            k_by_head = k.reshape([*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim])
+            k_by_head = self.k_norm(k_by_head)[0]
+            k = k_by_head.reshape(k.shape)
+
+            qkv_out = paddle.concat([q, k, v], axis=-1)
+        return qkv_out
 
 
 class LayerNorm(nn.Layer):
@@ -205,7 +392,6 @@ class LayerNorm(nn.Layer):
         else:
             self.norm_func: Callable = fused_layer_norm
         self.bias: Optional[paddle.Tensor] = bias
-        self._dtype: str = self._helper.get_default_dtype()
         self._norm_weight_dtype: str = "float32"
 
         self.quant_round_type: int = self.fd_config.quant_config.quant_round_type if fd_config.quant_config else 0

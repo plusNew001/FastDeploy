@@ -1,3 +1,17 @@
+# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 from typing import Optional, Tuple, Union
 
@@ -32,8 +46,8 @@ def flash_attn_unpadded_func(
     v: Tensor,
     cu_seqlens_q: Tensor,
     cu_seqlens_k: Tensor,
-    max_seqlen_q: Union[int, float],
-    max_seqlen_k: Union[int, float],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
     fixed_seed_offset: Optional[Tensor] = None,
     attn_mask: Optional[Tensor] = None,
     softmax_scale: float = 1.0,
@@ -43,9 +57,6 @@ def flash_attn_unpadded_func(
     is_test: bool = True,
     rng_name: str = "",
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    max_seqlen_q_t = paddle.to_tensor(max_seqlen_q, dtype="int64")
-    max_seqlen_k_t = paddle.to_tensor(max_seqlen_k, dtype="int64")
-
     outputs = paddle._C_ops.flash_attn_unpadded(
         q,
         k,
@@ -54,8 +65,8 @@ def flash_attn_unpadded_func(
         cu_seqlens_k,
         fixed_seed_offset,
         attn_mask,
-        max_seqlen_q_t,
-        max_seqlen_k_t,
+        max_seqlen_q,
+        max_seqlen_k,
         softmax_scale,
         dropout,
         causal,

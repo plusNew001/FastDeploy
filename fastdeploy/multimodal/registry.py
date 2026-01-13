@@ -1,7 +1,7 @@
 """
-# Copyright (c) 2025  PaddlePaddle Authors. All Rights Reserved.
+# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
 #
-# Licensed under the Apache License, Version 2.0 (the "License"
+# Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
@@ -14,32 +14,19 @@
 # limitations under the License.
 """
 
-from typing import Callable
-
 
 class MultimodalRegistry:
     """
     A registry for multimodal models
     """
 
-    mm_models: set[str] = set()
-
-    @classmethod
-    def register_model(cls, name: str = "") -> Callable:
-        """
-        Register model with the given name, class name is used if name is not provided.
-        """
-
-        def _register(model):
-            nonlocal name
-            if len(name) == 0:
-                name = model.__name__
-            if name in cls.mm_models:
-                raise ValueError(f"multimodal model {name} is already registered")
-            cls.mm_models.add(name)
-            return model
-
-        return _register
+    mm_models: set[str] = {
+        "Ernie4_5_VLMoeForConditionalGeneration",
+        "Ernie5MoeForCausalLM",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Ernie5ForCausalLM",
+        "Ernie4_5_VLMoeForProcessRewardModel",
+    }
 
     @classmethod
     def contains_model(cls, name: str) -> bool:

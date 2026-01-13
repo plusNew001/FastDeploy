@@ -1,3 +1,5 @@
+[简体中文](../zh/get_started/quick_start.md)
+
 # Deploy ERNIE-4.5-0.3B-Paddle in 10 Minutes
 
 Before deployment, ensure your environment meets the following requirements:
@@ -60,12 +62,13 @@ curl -i http://0.0.0.0:8180/health
 Send requests to the service with the following command:
 
 ```shell
-curl -X POST "http://0.0.0.0:8180/v1/chat/completions" \
+curl -X POST "http://0.0.0.0:1822/v1/chat/completions" \
 -H "Content-Type: application/json" \
 -d '{
   "messages": [
     {"role": "user", "content": "Write me a poem about large language model."}
-  ]
+  ],
+  "stream": true
 }'
 ```
 

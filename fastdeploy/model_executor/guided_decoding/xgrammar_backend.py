@@ -24,7 +24,7 @@ import torch
 
 from fastdeploy.config import FDConfig
 from fastdeploy.engine.request import Request
-from fastdeploy.model_executor.guided_decoding.base_guided_decoding import (
+from fastdeploy.model_executor.guided_decoding import (
     BackendBase,
     BaseChecker,
     LogitsProcessorBase,
@@ -57,7 +57,6 @@ class XGrammarProcessor(LogitsProcessorBase):
         max_rollback_tokens (int): Maximum number of tokens to rollback on mismatch
         vocab_size (int): Size of the vocabulary
         batch_size (int): Batch size for processing
-        splitwise_role (str): Role for splitwise processing
         compiled_grammar (CompiledGrammar): Compiled grammar rules
         terminate_without_stop_token (bool): Whether to terminate without stop token
         override_stop_tokens (Optional[List[int]]): Custom stop tokens
@@ -71,23 +70,22 @@ class XGrammarProcessor(LogitsProcessorBase):
         override_stop_tokens: Optional[List[int]] = None,
         vocab_size: Optional[int] = None,
         batch_size: Optional[int] = None,
-        splitwise_role: str = "mixed",
+        enable_thinking: bool = False,
     ):
-        super().__init__()
-        self.max_rollback_tokens = 200
+        super().__init__(enable_reasoning=enable_thinking)
         self.vocab_size = vocab_size
         self.batch_size = batch_size
-        self.splitwise_role = splitwise_role
         self.compiled_grammar = compiled_grammar
         self.terminate_without_stop_token = terminate_without_stop_token
         self.override_stop_tokens = override_stop_tokens
 
         self.matcher = GrammarMatcher(
             compiled_grammar=compiled_grammar,
-            max_rollback_tokens=self.max_rollback_tokens,
             terminate_without_stop_token=terminate_without_stop_token,
             override_stop_tokens=override_stop_tokens,
         )
+        # when matcher accept eos_token_id, is_terminated = True
+        self.is_terminated: bool = False
 
     def allocate_token_bitmask(self) -> torch.Tensor:
         """
@@ -111,40 +109,6 @@ class XGrammarProcessor(LogitsProcessorBase):
         """
         self.matcher.fill_next_token_bitmask(token_bitmask, idx)
 
-    def apply_token_mask(
-        self,
-        logits: paddle.Tensor,
-        token_bitmask: torch.Tensor,
-        indices: Optional[List[int]] = None,
-    ) -> paddle.Tensor:
-        """
-        Apply the token mask to the logits, modifying probabilities of invalid tokens.
-
-        Args:
-            logits (paddle.Tensor): The logits tensor to modify
-            token_bitmask (torch.Tensor): The token bitmask indicating allowed tokens
-            indices (Optional[List[int]]): Optional list of batch indices to apply mask to
-
-        Returns:
-            paddle.Tensor: The modified logits tensor
-        """
-        origin_place = logits.place
-        origin_dtype = logits.dtype
-        logits = torch.from_numpy(logits.numpy())
-
-        logits = logits.float()  # cpu
-        apply_token_bitmask_inplace(
-            logits=logits,
-            bitmask=token_bitmask.to(logits.device, non_blocking=True),
-            indices=indices,
-        )
-
-        return paddle.to_tensor(
-            logits.numpy(),
-            dtype=origin_dtype,
-            place=origin_place,
-        )
-
     def reset(self) -> None:
         """
         Reset the grammar matcher state to initial conditions.
@@ -157,23 +121,21 @@ class XGrammarProcessor(LogitsProcessorBase):
     def accept_token(self, token: int) -> None:
         """
         Validate and accept a generated token against the grammar constraints.
+        when accept eos_token, is_terminated = True
 
         Args:
             token (int): The token ID to validate
 
-        Raises:
-            AssertionError: If token is not allowed by the grammar
         """
-        assert self.matcher.accept_token(token), f"Failed to accept token {token}"
-
-    def is_terminated(self) -> bool:
-        """
-        Check if the grammar matching process has terminated.
-
-        Returns:
-            bool: True if matching has terminated, False otherwise
-        """
-        return self.matcher.is_terminated()
+        if self.is_terminated or self.matcher.is_terminated():
+            self.is_terminated = True
+            return False
+        if not self.matcher.accept_token(token):
+            self.matcher.reset()
+            return False
+        if self.matcher.is_terminated():
+            self.is_terminated = True
+        return True
 
     def copy(self) -> "XGrammarProcessor":
         """
@@ -188,7 +150,6 @@ class XGrammarProcessor(LogitsProcessorBase):
             override_stop_tokens=self.override_stop_tokens,
             vocab_size=self.vocab_size,
             batch_size=self.batch_size,
-            splitwise_role=self.splitwise_role,
         )
 
 
@@ -203,7 +164,6 @@ class XGrammarBackend(BackendBase):
         vocab_size (int): Size of the vocabulary from config
         batch_size (int): Maximum batch size from config
         any_whitespace (bool): Whether to allow any whitespace in JSON
-        splitwise_role (str): Role for splitwise processing
         grammar_compiler (GrammarCompiler): Grammar compilation engine
     """
 
@@ -214,14 +174,24 @@ class XGrammarBackend(BackendBase):
     ):
         super().__init__(fd_config=fd_config)
         self.vocab_size = fd_config.model_config.vocab_size
-        self.batch_size = fd_config.parallel_config.max_num_seqs
+        self.batch_size = fd_config.scheduler_config.max_num_seqs
 
-        self.any_whitespace = not fd_config.parallel_config.disable_any_whitespace
-        self.splitwise_role = fd_config.parallel_config.splitwise_role
+        self.any_whitespace = not fd_config.structured_outputs_config.disable_any_whitespace
 
         try:
             tokenizer_info = TokenizerInfo.from_huggingface(self.hf_tokenizer, vocab_size=self.vocab_size)
-            self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+            llm_logger.info(f"xgrammar_backend.py tokenizer_info={tokenizer_info.dump_metadata()}")
+            # Read configuration values, fallback to defaults if not set
+            xgrammar_cfg = getattr(fd_config, "xgrammar_config", {})
+            max_threads = getattr(xgrammar_cfg, "max_threads", 8)
+            cache_enabled = getattr(xgrammar_cfg, "cache_enabled", True)
+            cache_limit_bytes = getattr(xgrammar_cfg, "cache_limit_bytes", 4 * 1024 * 1024)
+            self.grammar_compiler = GrammarCompiler(
+                tokenizer_info=tokenizer_info,
+                max_threads=max_threads,
+                cache_enabled=cache_enabled,
+                cache_limit_bytes=cache_limit_bytes,
+            )
         except Exception as e:
             raise Exception(f"Failed to load XGrammar tokenizer: {e}")
 
@@ -230,6 +200,7 @@ class XGrammarBackend(BackendBase):
         compiled_grammar: CompiledGrammar,
         terminate_without_stop_token: bool = False,
         override_stop_tokens: Optional[List[int]] = None,
+        enable_thinking: bool = False,
     ) -> XGrammarProcessor:
         """
         Create a logits processor instance for the given compiled grammar.
@@ -238,6 +209,7 @@ class XGrammarBackend(BackendBase):
             compiled_grammar (CompiledGrammar): Compiled grammar rules
             terminate_without_stop_token (bool): Whether to terminate without stop token
             override_stop_tokens (Optional[List[int]]): Custom stop tokens to override defaults
+            enable_thinking (bool): Whether to enable thinking mode
 
         Returns:
             XGrammarProcessor: Configured grammar processor instance
@@ -248,15 +220,16 @@ class XGrammarBackend(BackendBase):
             override_stop_tokens=override_stop_tokens,
             vocab_size=self.vocab_size,
             batch_size=self.batch_size,
-            splitwise_role=self.splitwise_role,
+            enable_thinking=enable_thinking,
         )
 
-    def _json_processor(self, schemata: str) -> Optional[XGrammarProcessor]:
+    def _json_processor(self, schemata: str, enable_thinking: bool = False) -> Optional[XGrammarProcessor]:
         """
         Compile JSON schema into a grammar processor.
 
         Args:
             schemata (str): JSON schema string to compile
+            enable_thinking (bool): Whether to enable thinking mode
 
         Returns:
             Optional[XGrammarProcessor]: Configured processor if successful, None on failure
@@ -266,14 +239,15 @@ class XGrammarBackend(BackendBase):
         except Exception as e:
             llm_logger.error(f"Failed to compile json schema: {e}, {str(traceback.format_exc())}")
             return None
-        return self._create_processor(compiled_grammar)
+        return self._create_processor(compiled_grammar, enable_thinking=enable_thinking)
 
-    def _regex_processor(self, schemata: str) -> Optional[XGrammarProcessor]:
+    def _regex_processor(self, schemata: str, enable_thinking: bool = False) -> Optional[XGrammarProcessor]:
         """
         Compile regex pattern into a grammar processor.
 
         Args:
             schemata (str): Regex pattern string to compile
+            enable_thinking (bool): Whether to enable thinking mode
 
         Returns:
             Optional[XGrammarProcessor]: Configured processor if successful, None on failure
@@ -283,14 +257,15 @@ class XGrammarBackend(BackendBase):
         except Exception as e:
             llm_logger.error(f"Failed to compile regex schema: {e}, {str(traceback.format_exc())}")
             return None
-        return self._create_processor(compiled_grammar)
+        return self._create_processor(compiled_grammar, enable_thinking=enable_thinking)
 
-    def _grammar_processor(self, schemata: str) -> Optional[XGrammarProcessor]:
+    def _grammar_processor(self, schemata: str, enable_thinking: bool = False) -> Optional[XGrammarProcessor]:
         """
         Compile grammar (EBNF) into a grammar processor.
 
         Args:
             schemata (str): Grammar string in EBNF format
+            enable_thinking (bool): Whether to enable thinking mode
 
         Returns:
             Optional[XGrammarProcessor]: Configured processor if successful, None on failure
@@ -300,9 +275,9 @@ class XGrammarBackend(BackendBase):
         except Exception as e:
             llm_logger.error(f"Failed to compile ebnf schema: {e}, {str(traceback.format_exc())}")
             return None
-        return self._create_processor(compiled_grammar)
+        return self._create_processor(compiled_grammar, enable_thinking=enable_thinking)
 
-    def _structural_tag_processor(self, schemata: str) -> Optional[XGrammarProcessor]:
+    def _structural_tag_processor(self, schemata: str, enable_thinking: bool = False) -> Optional[XGrammarProcessor]:
         """
         Compile structural tags into a grammar processor.
 
@@ -327,7 +302,7 @@ class XGrammarBackend(BackendBase):
         except Exception as e:
             llm_logger.error(f"Failed to compile structural tags schema: {e}, {str(traceback.format_exc())}")
             return None
-        return self._create_processor(compiled_grammar)
+        return self._create_processor(compiled_grammar, enable_thinking=enable_thinking)
 
 
 class XGrammarChecker(BaseChecker):
@@ -467,3 +442,49 @@ class XGrammarChecker(BaseChecker):
         else:
             # regex is not format
             return request, None
+
+
+def apply_token_mask(
+    logits: paddle.Tensor,
+    token_bitmask: torch.Tensor,
+    indices: Optional[List[int]] = None,
+    is_cuda_platform: bool = True,
+) -> paddle.Tensor:
+    """
+    Apply the token mask to the logits, modifying probabilities of invalid tokens.
+
+    Args:
+        logits (paddle.Tensor): The logits tensor to modify
+        token_bitmask (torch.Tensor): The token bitmask indicating allowed tokens
+        indices (Optional[List[int]]): Optional list of batch indices to apply mask to
+
+    Returns:
+        paddle.Tensor: The modified logits tensor
+    """
+    skip_out_indices = len(indices) == logits.shape[0]
+    if is_cuda_platform:
+        dlpack = paddle.utils.dlpack.to_dlpack(logits)
+        t_logits = torch.from_dlpack(dlpack)
+        apply_token_bitmask_inplace(
+            logits=t_logits,
+            bitmask=token_bitmask.to(t_logits.device, non_blocking=True),
+            indices=indices if not skip_out_indices else None,
+        )
+        return logits
+    else:
+        origin_place = logits.place
+        origin_dtype = logits.dtype
+        logits = torch.from_numpy(logits.numpy())
+
+        logits = logits.float()  # cpu
+        apply_token_bitmask_inplace(
+            logits=logits,
+            bitmask=token_bitmask.to(logits.device, non_blocking=True),
+            indices=indices if not skip_out_indices else None,
+        )
+
+        return paddle.to_tensor(
+            logits.numpy(),
+            dtype=origin_dtype,
+            place=origin_place,
+        )
